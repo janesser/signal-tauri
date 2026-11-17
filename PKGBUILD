@@ -1,4 +1,5 @@
 # Maintainer: jan <jan@...>
+echo "I_AM_SOURCED" >> .sourced.log
 #
 # A native Signal Desktop client built with egui + presage. Built on cyberkleiber (the
 # fleet build host) and published to the lan-repo on the Pi: clients install via
