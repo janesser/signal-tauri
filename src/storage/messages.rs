@@ -281,6 +281,62 @@ impl<'a> MessageRepository<'a> {
         Ok(())
     }
 
+    /// Find an outgoing message that we sent ourselves, in this conversation and at roughly
+    /// this timestamp, regardless of whether it has already been confirmed by the server.
+    ///
+    /// Echoes of our own messages arrive late or without reliable context (a group echo might
+    /// not carry the group key), so nothing is guaranteed to still be `sending` when they get
+    /// here. Matching against any outgoing row from us is what prevents a confirmed echo from
+    /// becoming a ghost duplicate.
+    pub fn find_our_own_sent_message(
+        &self,
+        conversation_id: &str,
+        start_ts: i64,
+        end_ts: i64,
+        target_ts: i64,
+    ) -> Option<String> {
+        let conn = self.db.connection();
+        let conn = conn.lock().unwrap();
+
+        conn.query_row(
+            "SELECT id FROM messages 
+             WHERE direction = 'outgoing' AND conversation_id = ?
+               AND sent_at >= ? AND sent_at <= ?
+             ORDER BY ABS(sent_at - ?) LIMIT 1",
+            params![conversation_id, start_ts, end_ts, target_ts],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// Find any outgoing message that we sent, anywhere in the store and at roughly this
+    /// timestamp, regardless of its current status.
+    ///
+    /// Echoes can arrive late (after the pending window) or without reliable group context,
+    /// so a send may already be confirmed by the time it gets here. Finding any outgoing row
+    /// from us is what prevents a confirmed echo from becoming a ghost duplicate. Ordered by
+    /// how close its send timestamp is to the echo's, so the right row wins.
+    pub fn find_our_own_sent_across_all_conversations(
+        &self,
+        start_ts: i64,
+        end_ts: i64,
+        target_ts: i64,
+    ) -> Option<String> {
+        let conn = self.db.connection();
+        let conn = conn.lock().unwrap();
+
+        conn.query_row(
+            "SELECT id FROM messages 
+             WHERE direction = 'outgoing' AND sent_at >= ? AND sent_at <= ?
+             ORDER BY ABS(sent_at - ?) LIMIT 1",
+            params![start_ts, end_ts, target_ts],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten()
+    }
+
     /// Find an outgoing message that is still awaiting confirmation by the server
     /// (status `sending`) anywhere in the store and at roughly this timestamp.
     ///
@@ -714,6 +770,47 @@ mod tests {
         other.sent_at = Utc::now() - chrono::Duration::minutes(3);
         repo.save(&other).unwrap();
         assert_eq!(repo.find_pending_across_all_conversations(now - 60, now + 60, now).unwrap(), msg2.id);
+    }
+
+    #[test]
+    fn test_find_our_own_sent_across_all_conversations() {
+        let (db, _dir) = create_test_db();
+        create_test_conversation(&db, "conv1");
+        create_test_conversation(&db, "conv2");
+        let repo = MessageRepository::new(&db);
+
+        // A message confirmed as sent by a previous echo.
+        let mut msg = Message::new_text("conv1", "sender1", "First");
+        msg.status = MessageStatus::Sent;
+        msg.sent_at = Utc::now() - chrono::Duration::seconds(10);
+        repo.save(&msg).unwrap();
+
+        // A message still awaiting confirmation.
+        let mut pending = Message::new_text("conv2", "sender1", "Second");
+        pending.status = MessageStatus::Sending;
+        pending.sent_at = Utc::now();
+        repo.save(&pending).unwrap();
+
+        // Both rows are candidates, the closest to the echo's timestamp wins.
+        let now = Utc::now().timestamp();
+        assert_eq!(repo.find_our_own_sent_across_all_conversations(now - 60, now + 60, now).unwrap(), pending.id);
+        assert_eq!(
+            repo.find_our_own_sent_across_all_conversations(now - 60, now + 60, now - 10).unwrap(),
+            msg.id
+        );
+
+        // The per-conversation search finds rows of the reported conversation regardless of status.
+        assert_eq!(repo.find_our_own_sent_message("conv2", now - 60, now + 60, now).unwrap(), pending.id);
+
+        // A confirmed send in this conversation is the closest match.
+        assert_eq!(repo.find_our_own_sent_message("conv1", now - 60, now + 60, now).unwrap(), msg.id);
+        assert_eq!(repo.find_our_own_sent_message("conv2", now - 60, now + 60, now).unwrap(), pending.id);
+
+        // The row is outside the search window and therefore not returned.
+        let mut old = Message::new_text("conv1", "sender1", "Old");
+        old.sent_at = Utc::now() - chrono::Duration::hours(2);
+        repo.save(&old).unwrap();
+        assert!(repo.find_our_own_sent_across_all_conversations(now + 86400, now + 86500, now + 86450).is_none());
     }
 
     #[test]

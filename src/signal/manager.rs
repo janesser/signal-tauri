@@ -257,11 +257,8 @@ impl SignalManager {
             );
             send_event!(event_tx, SignalEvent::MessageHistoryAvailable);
 
-            let backup_key = provisioning::get_ephemeral_backup_key(&registration_data)
-                .expect("Backup key exists");
-
             match Self::sync_message_history_from_server(
-                &backup_key,
+                provisioning::get_ephemeral_backup_key(&registration_data),
                 &registration_data,
                 storage,
                 event_tx.clone(),
@@ -306,20 +303,30 @@ impl SignalManager {
     /// the primary device's message history) from Signal's servers and imports it
     /// into local storage. The ephemeral backup key that the primary exchanged while
     /// linking is required to decrypt the archive; it is single use only, so this
-    /// sync can only happen while the link is fresh. On later connects the server
-    /// only delivers new messages through the receive loop — older history is not
-    /// available again (see also the comment on `SignalEvent::MessageHistoryAvailable`).
+    /// sync can only happen while the link is fresh (see also the comment on
+    /// `SignalEvent::MessageHistoryAvailable`).
+    ///
+    /// Whether a new transfer archive is issued on each run depends on how the storage
+    /// service handles account credentials - the archive is requested again whenever
+    /// this runs. If the server answers 204, which means the primary device may still be
+    /// uploading, the request is retried with backoff (see also
+    /// `backup::fetch_transfer_archive_with_retries`).
     pub async fn sync_message_history_from_server(
-        backup_key: &[u8],
+        backup_key: Option<[u8; 32]>,
         registration_data: &RegistrationData,
         storage: &Arc<Storage>,
         event_tx: mpsc::UnboundedSender<SignalEvent>,
     ) -> Result<u32, SignalError> {
-        // The account password that presage generated while linking is stored in its
-        // SQLite kv store; it authenticates against the storage service. The ephemeral
-        // backup key that the primary device offered while linking is required to
-        // decrypt the archive and is not persisted after linking, which means this sync
-        // can only happen while the link is fresh (see also the doc comment).
+        // The ephemeral backup key that the primary offered while linking is stored by presage
+        // in its own kv store, so a restarted app can still fetch a transfer archive for this
+        // device instead of only having one shot while the link is fresh.
+        let Some(backup_key) = backup_key.or_else(|| provisioning::read_ephemeral_backup_key(storage.signal_db_path().as_path())) else {
+            tracing::warn!("No ephemeral backup key found - message history sync not possible");
+            return Err(SignalError::StorageError("No ephemeral backup key found".to_string()));
+        };
+
+        // The account password that presage generated while linking is stored in its SQLite kv
+        // store; it authenticates against the storage service.
         let Some(password) = provisioning::read_account_password(storage.signal_db_path().as_path()) else {
             tracing::warn!("No account password found - message history sync not possible");
             return Err(SignalError::StorageError("No account password found".to_string()));
@@ -334,13 +341,16 @@ impl SignalManager {
 
         event_tx.send(SignalEvent::MessageHistorySyncProgress { current: 0, total: 0 }).ok();
 
-        let backup_data = crate::signal::backup::sync_message_history(
-            &backup_key,
-            &registration_data.service_ids.aci,
-            &auth_username,
-            &password,
-        )
-        .await?;
+        let backup_info = crate::signal::backup::fetch_transfer_archive_with_retries(&auth_username, &password).await?;
+        tracing::info!("Transfer archive available on CDN {}", backup_info.cdn);
+
+        let encrypted_backup = crate::signal::backup::download_backup(&backup_info).await?;
+        tracing::info!("Downloaded {} bytes of encrypted backup", encrypted_backup.len());
+
+        let decrypted = crate::signal::backup::decrypt_backup(&encrypted_backup, &backup_key, &registration_data.service_ids.aci)?;
+        tracing::info!("Decrypted {} bytes of backup data", decrypted.len());
+
+        let backup_data = crate::signal::backup::parse_backup(&decrypted)?;
 
         let message_count = backup_data.messages.len() as u32;
         let conversation_count = backup_data.conversations.len();
@@ -424,9 +434,29 @@ impl SignalManager {
         .map_err(|e| SignalError::StorageError(e.to_string()))?;
 
         // Try to load existing manager
-        let _manager = Manager::load_registered(store)
+        let manager = Manager::load_registered(store)
             .await
             .map_err(|e| SignalError::NotRegistered)?;
+
+        let registration_data = manager.registration_data();
+
+        // Old messages only come from a transfer archive, not from the receive loop - sync
+        // history whenever there is no local message history to fall back on.
+        let has_history = storage.database()
+            .map(|db| MessageRepository::new(&db).total_count() > 0)
+            .unwrap_or(false);
+
+        if !has_history {
+            tracing::info!("No local message history - syncing history from the primary device");
+            match Self::sync_message_history_from_server(None, registration_data, storage, event_tx.clone()).await {
+                Ok(count) => event_tx.send(SignalEvent::MessageHistorySyncCompleted {
+                    message_count: count,
+                }).ok(),
+                Err(e) => event_tx.send(SignalEvent::MessageHistorySyncFailed(e.to_string())).ok(),
+            }
+        } else {
+            tracing::info!("Local message history present - skipping history sync");
+        }
 
         let manager = Self {
             storage: storage.clone(),
@@ -922,12 +952,11 @@ impl SignalManager {
     }
 
     /// Mark the messages that a delivery/read receipt refers to in local storage.
-    async fn handle_delivery_receipt(
-        storage: &Arc<Storage>,
-        receipt: &ReceiptMessage,
-        content: &Content,
-        event_tx: mpsc::UnboundedSender<SignalEvent>,
-    ) {
+    ///
+    /// The server identifies the message only by the send timestamp of the message it refers to, not
+    /// by conversation or message ID, so we match against all our sent messages at that time. If
+    /// nothing matches within the normal 60 s window, a wider fallback covers larger clock drift
+    /// between the app and the server - see `find_receipt_targets`.
         let Some(db) = storage.database() else {
             tracing::warn!("No database available, cannot mark messages delivered");
             return;
@@ -941,10 +970,7 @@ impl SignalManager {
         let is_read = matches!(receipt.r#type(), receipt_message::Type::Read | receipt_message::Type::Viewed);
 
         for timestamp in &receipt.timestamp {
-            let message_ids = repo.find_by_send_timestamp(
-                (*timestamp as i64) / 1000 - 60,
-                (*timestamp as i64) / 1000 + 60,
-            );
+            let message_ids = find_receipt_targets(&repo, (*timestamp as i64) / 1000);
 
             if message_ids.is_empty() {
                 tracing::debug!("No sent messages found for receipt at {}", timestamp);
@@ -982,6 +1008,26 @@ impl SignalManager {
         }
     }
 
+    /// Find the messages that a delivery/read receipt refers to.
+    ///
+    /// The server identifies the message only by the send timestamp of the message it refers to, not
+    /// by conversation or message ID, so we match against all our sent messages at that time. A ±60 s
+    /// window covers normal clock skew between the app and the server; if nothing matches within it, a
+    /// wider fallback catches larger drift (a receipt never refers to a message sent long ago).
+    fn find_receipt_targets(repo: &MessageRepository, timestamp: i64) -> Vec<String> {
+        let narrow = repo.find_by_send_timestamp(timestamp - 60, timestamp + 60);
+
+        if !narrow.is_empty() {
+            return narrow;
+        }
+
+        tracing::debug!(
+            "No sent messages found for receipt at {} within 60 s, retrying with a wider window",
+            timestamp
+        );
+        repo.find_by_send_timestamp(timestamp - 3600, timestamp + 3600)
+    }
+
     /// Mark the messages that a read receipt over the sync channel refers to.
     ///
     /// The read receipts of the other person's devices arrive via the sync channel and are
@@ -1001,10 +1047,7 @@ impl SignalManager {
         for read in &sync_message.read {
             let Some(timestamp) = read.timestamp else { continue };
 
-            let message_ids = repo.find_by_send_timestamp(
-                (timestamp as i64) / 1000 - 60,
-                (timestamp as i64) / 1000 + 60,
-            );
+            let message_ids = find_receipt_targets(&repo, (timestamp as i64) / 1000);
 
             if message_ids.is_empty() {
                 tracing::debug!("No sent messages found for read receipt at {}", timestamp);
@@ -1037,9 +1080,11 @@ impl SignalManager {
     /// echo was also saved as an *incoming* message, every sent message would
     /// appear twice in the conversation — the "echo/feedback loop".
     ///
-    /// This looks for a locally-sent message that is still awaiting confirmation
-    /// (status `sending`) in the same conversation and at roughly the same
-    /// timestamp, and confirms it instead of creating a duplicate row.
+    /// This looks for a locally-sent message that matches this echo. A send that is
+    /// still awaiting confirmation gets confirmed (status `sending` → `sent`); an
+    /// echo of a send that was already confirmed would create a duplicate row, so it
+    /// is suppressed instead. Nothing is treated as our own echo unless the local
+    /// store actually knows about the matching send.
     async fn handle_our_own_message_echo(
         storage: &Arc<Storage>,
         own_identity: &str,
@@ -1110,39 +1155,84 @@ impl SignalManager {
         };
         let repo = MessageRepository::new(&db);
 
-        // Look for a locally-sent message that hasn't been confirmed yet. The server may not
-        // report the conversation reliably (group echoes without group context, or echoes
-        // without a destination), so if nothing matches the reported conversation we also look
-        // across all conversations by timestamp - this is how we know which of our own messages
-        // was echoed back.
+        // Match this echo against our own sends in the local store. The server may not report
+        // the conversation reliably (group echoes without group context, or echoes without a
+        // destination), so if nothing matches the reported conversation we also look across all
+        // conversations by timestamp - this is how we know which of our own messages was echoed
+        // back.
         let timestamp = (timestamp as i64) / 1000;
-        let message_id = match &conversation_id {
-            Some(id) => repo.find_pending(id, timestamp - 60, timestamp + 60).or_else(|| {
-                tracing::debug!("No local message found for echo in conversation {} at {}", id, timestamp);
-                repo.find_pending_across_all_conversations(timestamp - 60, timestamp + 60, timestamp)
-            }),
+
+        // A send that is still awaiting confirmation gets confirmed here, so the echo doesn't
+        // sit at `sending` while its duplicate shows up as an incoming message. The content has
+        // to match too - messages synced from one of our other devices carry the same account
+        // identity and could otherwise be swallowed as if they were our own echo.
+        if let Some(message_id) = match &conversation_id {
+            Some(id) => repo.find_pending(id, timestamp - 60, timestamp + 60),
             None => repo.find_pending_across_all_conversations(timestamp - 60, timestamp + 60, timestamp),
-        };
+        } {
+            let matches = match repo.get(&message_id) {
+                Some(message) => Self::content_matches_echo(&message.content, &content.body),
+                None => false,
+            };
 
-        let Some(message_id) = message_id else {
-            return None;
-        };
+            if !matches {
+                tracing::debug!(
+                    "Echo at {} doesn't match the pending send {}",
+                    timestamp,
+                    message_id
+                );
+                return None;
+            }
 
-        // Confirm the message instead of creating a duplicate row.
-        if let Err(e) = repo.update_status(&message_id, MessageStatus::Sent) {
-            tracing::warn!("Failed to confirm message {}: {}", message_id, e);
-            return None;
+            if let Err(e) = repo.update_status(&message_id, MessageStatus::Sent) {
+                tracing::warn!("Failed to confirm message {}: {}", message_id, e);
+                return None;
+            }
+
+            // Notify the app so that it refreshes the message status in the UI.
+            send_event!(event_tx, SignalEvent::MessageStatusChanged { message_id: message_id.clone(), status: MessageStatus::Sent });
+
+            tracing::debug!("Confirmed message {} echoed back by the server", message_id);
+
+            return Some(message_id);
         }
 
-        // Notify the app so that it refreshes the message status in the UI.
-        send_event!(event_tx, SignalEvent::MessageStatusChanged { message_id: message_id.clone(), status: MessageStatus::Sent });
+        // No pending send at this time. An echo of a send that was already confirmed (a late
+        // echo, or one that missed its group context) would create a duplicate row if kept, so
+        // it is suppressed instead. The reported conversation narrows the search; only when the
+        // server didn't report one reliably do we look across all conversations - again by
+        // timestamp proximity, so the closest match wins. A message synced from our other
+        // device at the same moment has different content and isn't matched here.
+        let known_message_id = match &conversation_id {
+            Some(id) => repo.find_our_own_sent_message(id, timestamp - 60, timestamp + 60, timestamp).or_else(|| {
+                tracing::debug!("No local send found for echo in conversation {} at {}", id, timestamp);
+                repo.find_our_own_sent_across_all_conversations(timestamp - 60, timestamp + 60, timestamp)
+            }),
+            None => repo.find_our_own_sent_across_all_conversations(timestamp - 60, timestamp + 60, timestamp),
+        };
 
-        tracing::debug!(
-            "Confirmed message {} echoed back by the server",
-            message_id
-        );
+        if let Some(message_id) = known_message_id {
+            tracing::debug!("Suppressing duplicate echo of already confirmed message {}", message_id);
+            return Some(message_id);
+        }
 
-        Some(message_id)
+        // The store doesn't know about the send this echo refers to - it stays a genuine incoming message.
+        None
+    }
+
+    /// Check whether an incoming content envelope matches a local outgoing message.
+    ///
+    /// Messages we send and messages synced from one of our other devices both arrive with
+    /// our account identity, so a text body comparison is the only way to tell them apart: a
+    /// genuine echo carries the exact same content as the send it confirms.
+    fn content_matches_echo(local: &crate::signal::messages::Content, echo_body: &ContentBody) -> bool {
+        match (local, echo_body) {
+            (
+                crate::signal::messages::Content::Text { body, .. },
+                ContentBody::DataMessage(msg),
+            ) => msg.body.as_deref() == Some(body),
+            _ => false,
+        }
     }
 
     fn process_content(content: &Content) -> Option<IncomingMessage> {

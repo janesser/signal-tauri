@@ -11,6 +11,16 @@ impl Database {
     pub fn open_encrypted(path: &Path, passphrase: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "key", passphrase)?;
+
+        // The app database is written from the main thread and from the message receive loop
+        // (a separate thread), so its readers and writers share this single connection.
+        // journal_mode=WAL lets readers and writers coexist without blocking each other -
+        // without it, a write locks out every reader and every read locks out every writer,
+        // which stalls the interface as soon as both sides are active. busy_timeout makes
+        // transient lock contention resolve by waiting instead of failing with 'database is locked'.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "busy_timeout", "5000")?;
+
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
         };

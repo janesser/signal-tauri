@@ -75,6 +75,38 @@ pub fn has_backup_key(data: &RegistrationData) -> bool {
     data.ephemeral_backup_key().is_some()
 }
 
+/// Read the ephemeral backup key that presage stored in its SQLite kv store.
+///
+/// `Manager::link_secondary_device` stores the full registration data as JSON (key `registration`)
+/// in the SQLite kv table, and presage keeps the ephemeral backup key that the primary offered
+/// while linking inside it. Reading it here lets a restarted app fetch a transfer archive for the
+/// same device instead of only having one shot while the link is fresh. Returns `None` if the key
+/// was never persisted (an app started through `perform_linking` still carries it in memory).
+pub fn read_ephemeral_backup_key(db_path: &std::path::Path) -> Option<[u8; 32]> {
+    let conn = rusqlite::Connection::open(db_path).ok()?;
+    let value: String = conn.query_row(
+        "SELECT value FROM kv WHERE key = 'registration'",
+        [],
+        |row| row.get(0),
+    )
+    .ok()?;
+
+    serde_json::from_str::<serde_json::Value>(&value)
+        .ok()
+        .and_then(|v| v["ephemeral_backup_key"].as_array())
+        .map(|k| {
+            k.iter()
+                .map(|i| i.as_u64().unwrap_or(0) as u8)
+                .collect::<Vec<u8>>()
+        })
+        .filter(|k| k.len() == 32)
+        .map(|k| {
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&k);
+            bytes
+        })
+}
+
 /// The ephemeral backup key that presage received from the primary device.
 ///
 /// Returns `None` if no history could be transferred.

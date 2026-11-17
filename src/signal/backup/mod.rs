@@ -45,24 +45,56 @@ pub struct BackupConversation {
     pub name: Option<String>,
 }
 
-pub async fn sync_message_history(
-    ephemeral_backup_key: &[u8],
-    aci: &uuid::Uuid,
-    auth_username: &str,
-    auth_password: &str,
-) -> Result<BackupData, SignalError> {
-    tracing::info!("Starting message history sync...");
-    
-    let archive_info = fetch_transfer_archive(auth_username, auth_password).await?;
-    tracing::info!("Transfer archive located at CDN {}", archive_info.cdn);
-    
-    let encrypted_backup = download_backup(&archive_info).await?;
-    tracing::info!("Downloaded {} bytes of encrypted backup", encrypted_backup.len());
-    
-    let decrypted = decrypt_backup(&encrypted_backup, ephemeral_backup_key, aci)?;
-    tracing::info!("Decrypted {} bytes of backup data", decrypted.len());
-    
-    parse_backup(&decrypted)
+/// Parse a decrypted transfer archive into the app's backup data format.
+///
+/// This was previously only reachable through `sync_message_history`; the history sync now runs
+/// these steps with retries and account credentials, so it is called directly.
+pub fn parse_backup(data: &[u8]) -> Result<BackupData, SignalError> {
+    tracing::info!("Parsing backup data ({} bytes)...", data.len());
+
+    let decompressed = decompress_backup(data)?;
+    tracing::info!("Decompressed to {} bytes", decompressed.len());
+
+    let mut messages = Vec::new();
+    let mut conversations = Vec::new();
+    let mut chats = Vec::new();
+    let mut offset = 0;
+    let mut frame_count = 0;
+
+    while offset < decompressed.len() {
+        let frame_len = match read_varint(&decompressed, &mut offset) {
+            Some(len) => len as usize,
+            None => break,
+        };
+
+        if offset + frame_len > decompressed.len() {
+            tracing::warn!("Frame extends beyond data boundary, stopping");
+            break;
+        }
+
+        let frame_data = &decompressed[offset..offset + frame_len];
+        offset += frame_len;
+        frame_count += 1;
+
+        if let Err(e) = parse_frame(frame_data, &mut messages, &mut conversations, &mut chats) {
+            tracing::debug!("Frame {} parse error (non-fatal): {}", frame_count, e);
+        }
+    }
+
+    tracing::info!(
+        "Parsed {} frames: {} conversations, {} chats, {} messages",
+        frame_count,
+        conversations.len(),
+        chats.len(),
+        messages.len()
+    );
+
+    Ok(BackupData {
+        messages,
+        conversations,
+        chats,
+        frame_count,
+    })
 }
 
 /// Import backup data into local storage
@@ -277,54 +309,6 @@ fn read_varint(data: &[u8], offset: &mut usize) -> Option<u64> {
         }
     }
     None
-}
-
-fn parse_backup(data: &[u8]) -> Result<BackupData, SignalError> {
-    tracing::info!("Parsing backup data ({} bytes)...", data.len());
-    
-    let decompressed = decompress_backup(data)?;
-    tracing::info!("Decompressed to {} bytes", decompressed.len());
-    
-    let mut messages = Vec::new();
-    let mut conversations = Vec::new();
-    let mut chats = Vec::new();
-    let mut offset = 0;
-    let mut frame_count = 0;
-    
-    while offset < decompressed.len() {
-        let frame_len = match read_varint(&decompressed, &mut offset) {
-            Some(len) => len as usize,
-            None => break,
-        };
-        
-        if offset + frame_len > decompressed.len() {
-            tracing::warn!("Frame extends beyond data boundary, stopping");
-            break;
-        }
-        
-        let frame_data = &decompressed[offset..offset + frame_len];
-        offset += frame_len;
-        frame_count += 1;
-        
-        if let Err(e) = parse_frame(frame_data, &mut messages, &mut conversations, &mut chats) {
-            tracing::debug!("Frame {} parse error (non-fatal): {}", frame_count, e);
-        }
-    }
-    
-    tracing::info!(
-        "Parsed {} frames: {} conversations, {} chats, {} messages",
-        frame_count,
-        conversations.len(),
-        chats.len(),
-        messages.len()
-    );
-    
-    Ok(BackupData {
-        messages,
-        conversations,
-        chats,
-        frame_count,
-    })
 }
 
 fn parse_frame(

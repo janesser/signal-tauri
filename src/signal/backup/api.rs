@@ -38,12 +38,12 @@ pub async fn fetch_transfer_archive(
     password: &str,
 ) -> Result<TransferArchiveInfo, SignalError> {
     let client = build_signal_client()?;
-    
+
     let timeout_secs = 300;
     let url = format!("{}/v1/devices/transfer_archive?timeout={}", SIGNAL_API_BASE, timeout_secs);
-    
+
     tracing::info!("Fetching transfer archive with {}s timeout...", timeout_secs);
-    
+
     let response = client
         .get(&url)
         .basic_auth(username, Some(password))
@@ -51,16 +51,16 @@ pub async fn fetch_transfer_archive(
         .send()
         .await
         .map_err(|e| SignalError::NetworkError(format!("Failed to fetch transfer archive: {}", e)))?;
-    
+
     let status = response.status();
     tracing::debug!("Transfer archive response status: {}", status);
-    
+
     if status == reqwest::StatusCode::NO_CONTENT {
         return Err(SignalError::NetworkError(
             "Transfer archive not ready yet (204), phone may still be uploading".into()
         ));
     }
-    
+
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         return Err(SignalError::NetworkError(format!(
@@ -68,12 +68,12 @@ pub async fn fetch_transfer_archive(
             status, body
         )));
     }
-    
+
     let archive_response: TransferArchiveResponse = response
         .json()
         .await
         .map_err(|e| SignalError::ProtocolError(format!("Failed to parse transfer archive response: {}", e)))?;
-    
+
     match archive_response {
         TransferArchiveResponse::Success(info) => {
             tracing::info!("Transfer archive available on CDN {}", info.cdn);
@@ -83,6 +83,42 @@ pub async fn fetch_transfer_archive(
             Err(SignalError::ProtocolError(format!("Transfer archive error: {}", error)))
         }
     }
+}
+
+/// Fetch a transfer archive from Signal's storage service, retrying when the primary device
+/// may still be uploading: the server answers 204 for that and we can't download anything.
+pub async fn fetch_transfer_archive_with_retries(
+    username: &str,
+    password: &str,
+) -> Result<TransferArchiveInfo, SignalError> {
+    const MAX_RETRIES: u32 = 5;
+    let mut delay_ms = 1000;
+
+    for attempt in 0..MAX_RETRIES {
+        match fetch_transfer_archive(username, password).await {
+            Ok(info) => return Ok(info),
+            Err(SignalError::NetworkError(ref e)) if is_archive_not_ready(e) && attempt + 1 < MAX_RETRIES => {
+                tracing::warn!(
+                    "Transfer archive not ready yet, retrying in {}ms (attempt {}/{} of {})",
+                    delay_ms,
+                    attempt + 1,
+                    MAX_RETRIES
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                delay_ms *= 2;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(SignalError::NetworkError(
+        "Transfer archive request failed after retries".into()
+    ))
+}
+
+/// Whether the server's error means the transfer archive is not ready yet and we should retry.
+fn is_archive_not_ready(error: &str) -> bool {
+    error.starts_with("Transfer archive not ready yet (204)")
 }
 
 pub async fn download_backup(archive_info: &TransferArchiveInfo) -> Result<Vec<u8>, SignalError> {

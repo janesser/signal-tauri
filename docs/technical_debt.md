@@ -15,6 +15,8 @@ Known limitations and open work in the app's Signal layer (state after the 743ed
 
 **Confirmed fixes (Nov 17, 2026).** When the server's echo does not report a conversation that matches our local store — e.g. echoes without a destination, or echoes whose `destination_service_id` does not equal the key used by the app's conversations — the old code left the sent message permanently marked `sending` and created a duplicate incoming row in another chat (often appearing as an own-message in the Note-to-Self chat). Echo confirmation now falls back to finding a pending outgoing row across all conversations, matched on send timestamp. Additionally, `SyncMessage::Sent` is only treated as our own echo when the envelope sender is actually us, so messages synced from the primary device are no longer misattributed to ourselves.
 
+**Additional fix (Nov 17, 2026).** A pending match was previously accepted without checking that the echo refers to *that* send — a message synced from one of our other devices carries the same account identity and could be swallowed as if it were our own echo. Confirmation now also verifies the text body matches the local row's content. Echoes of sends that are already confirmed (late echoes, group echoes without group context) are additionally suppressed via `find_our_own_sent_message`/`find_our_own_sent_across_all_conversations`, which locate any outgoing send of ours at that time rather than only pending ones — so a confirmed echo can no longer become a ghost duplicate. This cannot be verified against a live account without a test harness that replays echoes (there is no such test yet).
+
 ## Delivery and read receipts
 
 **Problem.** The app never updated the status of messages it had sent.
@@ -26,7 +28,7 @@ Known limitations and open work in the app's Signal layer (state after the 743ed
 - `mark_delivered()` refuses to downgrade an already-read message, so a late delivery receipt cannot overwrite a read receipt.
 - Both paths emit events (`DeliveryReceipt`/`ReadReceipt`) so the UI marks the status in the database (idempotent) and invalidates its message cache for a repaint.
 
-**Remaining risk.** The ±60 s window assumes the app's clock matches the server's within a minute; bigger clock skew silently drops the update. A receipt that arrives *after* the read state has already been applied is skipped by design. Read receipts are only ever marked on messages *we sent* — received messages are never tracked as "read" in this store (which is correct for the Signal protocol: only the sender learns whether a message was read).
+**Remaining risk.** Receipts that arrive *after* the read state has already been applied are skipped by design. Read receipts are only ever marked on messages *we sent* — received messages are never tracked as "read" in this store (which is correct for the Signal protocol: only the sender learns whether a message was read). The original ±60 s match window silently dropped receipts when the app's clock drifted more than a minute from the server's - fixed by retrying with a ±1 h window if nothing matches within the first 60 s.
 
 ## History sync on connect
 
@@ -36,7 +38,9 @@ Known limitations and open work in the app's Signal layer (state after the 743ed
 - the account password that presage generated while linking, stored in presage's own SQLite kv store (`provisioning::read_account_password`), and
 - the auth username `aci.device_id`.
 
-**Remaining risk.** Because the ephemeral backup key is single-use, the sync can only happen *right after* linking. On every later connect the server only delivers new messages through the receive loop — older history is not retrievable again. If presage's kv store no longer holds the account password (e.g. because the store was re-created), the sync fails with "No account password found".
+The sync now also runs on every later connect — but only when there is no local message history to fall back on - so it retries a transfer archive with account credentials once per connection. The ephemeral backup key is additionally read from presage's kv store (where presage persists it) instead of relying on the in-memory capture, and requests that are answered 204 ("phone may still be uploading") are retried with backoff via `backup::fetch_transfer_archive_with_retries`.
+
+**Remaining risk.** Whether the storage service re-issues a transfer archive decryptable by this device on every connect is server-dependent - the app requests one each time but cannot know in advance whether it will succeed. If presage's kv store no longer holds the account password (e.g. because the store was re-created), the sync fails with "No account password found".
 
 ## Missing / stubbed behaviour
 
@@ -54,5 +58,5 @@ Things that exist in the app as placeholders and still need real implementations
 
 ## Notes on the underlying stack
 
-- The manager's receive loop owns its own presage `SqliteStore` (opened at `storage.signal_db_path()`), while the app's repository layer owns the local SQLite database (`storage.database()`). Both connect to the same Signal store file when the local DB is the Signal store; SQLite connections are locked internally, so concurrent writes are serialized but never merged.
+- The manager's receive loop owns its own presage `SqliteStore` (opened at `storage.signal_db_path()`), while the app's repository layer owns the local SQLite database (`storage.database()`). Both connect to the same Signal store file when the local DB is the Signal store; SQLite connections are locked internally, so concurrent writes are serialized but never merged. The receive loop and the UI both write to `app.db` through a single shared connection - fixed by enabling `journal_mode=WAL` (readers and writers no longer block each other) and a 5 s busy timeout on lock contention.
 - Timestamps flow through three units: presage gives `u64` millisecond timestamps (receipts, echoes), the app's `sent_at`/`delivered_at` columns store **seconds** since the Unix epoch, and all conversions in this layer divide by 1000 with an explicit `as i64` cast. Never remove those casts — they are a known source of compile errors.
