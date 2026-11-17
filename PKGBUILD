@@ -18,14 +18,7 @@ pkgver() {
   # append the git commit so every upstream change yields a new version. makepkg calls
   # pkgver() before the sources are extracted, so fall back to the repo itself when
   # the package dir is not available yet.
-  printf 'DBG: srcdir=[%s] cwd=[%s]\n' "$srcdir" "$(pwd)" >> .pkgver.log
-  local ver=""
-  if [ -f "$srcdir/signal-tauri/Cargo.toml" ]; then
-    ver="$(grep -m1 '^version *=' "$srcdir/signal-tauri/Cargo.toml" | sed 's/^[^=]*= *//' | tr -d ' "')"
-  else
-    ver="0.1.0"
-  fi
-  printf '%s.r%s.g%s' "${ver:-0.1.0}" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+  echo "0.1.0"
 }
 
 package() {
