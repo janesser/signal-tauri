@@ -11,6 +11,8 @@ license=('MIT')
 makedepends=(rust cargo git)
 source=("signal-tauri::git+https://github.com/janesser/signal-tauri.git")
 
+pkgrel=1
+
 pkgver() {
   # mirror Cargo.toml's version (TOML: `version = "0.1.0"` — the spaces matter) and
   # append the git commit so every upstream change yields a new version. makepkg calls
