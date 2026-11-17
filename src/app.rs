@@ -321,6 +321,30 @@ impl SignalApp {
                 crate::ui::views::chat_list::invalidate_conversations_cache();
                 crate::ui::views::chat_list::invalidate_contacts_cache();
             }
+            SignalEvent::DeliveryReceipt { message_id, recipient } => {
+                tracing::info!(
+                    "Received delivery receipt for message {} in {}",
+                    message_id,
+                    recipient
+                );
+                self.mark_message_status(&message_id, MessageStatus::Delivered);
+            }
+            SignalEvent::ReadReceipt { message_id, recipient } => {
+                tracing::info!(
+                    "Received read receipt for message {} in {}",
+                    message_id,
+                    recipient
+                );
+                self.mark_message_status(&message_id, MessageStatus::Read);
+            }
+            SignalEvent::MessageStatusChanged { message_id, status } => {
+                tracing::info!(
+                    "Message {} status changed to {:?}",
+                    message_id,
+                    status
+                );
+                self.mark_message_status(&message_id, status);
+            }
             _ => {
                 tracing::debug!("Received event: {:?}", event);
             }
@@ -399,6 +423,23 @@ impl SignalApp {
         }
 
         tracing::info!("Saved message {} from {}", incoming.id, incoming.sender);
+    }
+
+    /// Mark a message with a new status (delivery/read receipt handling) and
+    /// refresh the caches so that the chat view shows the new status.
+    fn mark_message_status(&self, message_id: &str, status: MessageStatus) {
+        let Some(db) = self.storage.database() else {
+            tracing::warn!("No database available, cannot mark message status");
+            return;
+        };
+        let repo = MessageRepository::new(&*db);
+
+        if let Err(e) = repo.update_status(message_id, status) {
+            tracing::error!("Failed to update message {} status: {}", message_id, e);
+            return;
+        }
+
+        crate::ui::views::chat_view::invalidate_messages_cache();
     }
 
     /// Start the device linking process

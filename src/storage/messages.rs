@@ -228,12 +228,50 @@ impl<'a> MessageRepository<'a> {
         Ok(())
     }
 
-    /// Mark messages as delivered
+    /// Find all outgoing messages we sent at roughly this timestamp, regardless of which
+    /// conversation they belong to.
+    ///
+    /// The Signal server identifies receipts (delivery/read) only by the send timestamp of
+    /// the message they refer to and doesn't tell us which conversation it was in. Matching
+    /// against our own sent messages is therefore the only reliable way to know which one
+    /// was received.
+    pub fn find_by_send_timestamp(&self, start_ts: i64, end_ts: i64) -> Vec<String> {
+        let conn = self.db.connection();
+        let conn = conn.lock().unwrap();
+
+        let mut message_ids = Vec::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT id FROM messages 
+             WHERE direction = 'outgoing'
+               AND sent_at >= ? AND sent_at <= ?
+             ORDER BY sent_at DESC",
+        ) {
+            if let Ok(rows) = stmt.query_map(params![start_ts, end_ts], |row| row.get::<usize, String>(0)) {
+                message_ids = rows.filter_map(|r| r.ok()).collect();
+            }
+        }
+
+        message_ids
+    }
+
+    /// Mark messages as delivered. Messages that are already marked as read are skipped so
+    /// that a receipt can't downgrade their status.
     pub fn mark_delivered(&self, message_ids: &[String], timestamp: DateTime<Utc>) -> Result<()> {
         let conn = self.db.connection();
         let conn = conn.lock().unwrap();
 
         for id in message_ids {
+            // Don't downgrade a message that was already marked as read.
+            if let Ok(status) = conn.query_row(
+                "SELECT status FROM messages WHERE id = ?",
+                params![id],
+                |row| row.get::<usize, String>(0),
+            ) {
+                if status == "read" {
+                    continue;
+                }
+            }
+
             conn.execute(
                 "UPDATE messages SET status = 'delivered', delivered_at = ? WHERE id = ?",
                 params![timestamp.timestamp(), id],
@@ -241,6 +279,35 @@ impl<'a> MessageRepository<'a> {
         }
 
         Ok(())
+    }
+
+    /// Find an outgoing message that is still awaiting confirmation by the server
+    /// (status `sending`) anywhere in the store and at roughly this timestamp.
+    ///
+    /// The Signal server does not reliably report which conversation an echo of one of our
+    /// own messages belongs to, so matching purely on the reported destination/group context
+    /// leaves our sent messages unconfirmed. Searching across all conversations by timestamp
+    /// guarantees we confirm our own message instead of a duplicate being created elsewhere.
+    /// Ordered by how close its send timestamp is to the echo's, so the right row wins.
+    pub fn find_pending_across_all_conversations(
+        &self,
+        start_ts: i64,
+        end_ts: i64,
+        target_ts: i64,
+    ) -> Option<String> {
+        let conn = self.db.connection();
+        let conn = conn.lock().unwrap();
+
+        conn.query_row(
+            "SELECT id FROM messages 
+             WHERE direction = 'outgoing' AND status = 'sending'
+               AND sent_at >= ? AND sent_at <= ?
+             ORDER BY ABS(sent_at - ?) LIMIT 1",
+            params![start_ts, end_ts, target_ts],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten()
     }
 
     /// Mark messages as read up to a timestamp
@@ -255,6 +322,42 @@ impl<'a> MessageRepository<'a> {
              SET status = 'read', read_at = ?
              WHERE conversation_id = ? AND sent_at <= ? AND direction = 'incoming' AND read_at IS NULL",
             params![now, conversation_id, up_to_timestamp.timestamp()],
+        )?;
+
+        Ok(())
+    }
+
+    /// Find an outgoing message that is still awaiting confirmation by the server
+    /// (status `sending`) in this conversation and at roughly this timestamp.
+    ///
+    /// The Signal server echoes back messages we sent ourselves so that all linked
+    /// devices see them; this allows such an echo to be confirmed against the local
+    /// message instead of creating a duplicate incoming row.
+    pub fn find_pending(&self, conversation_id: &str, start_ts: i64, end_ts: i64) -> Option<String> {
+        let conn = self.db.connection();
+        let conn = conn.lock().unwrap();
+
+        conn.query_row(
+            "SELECT id FROM messages 
+             WHERE conversation_id = ? AND direction = 'outgoing' AND status = 'sending'
+               AND sent_at >= ? AND sent_at <= ?
+             ORDER BY sent_at DESC
+             LIMIT 1",
+            params![conversation_id, start_ts, end_ts],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// Mark a single message as read, with the timestamp of the read.
+    pub fn mark_read_single(&self, id: &str, read_at: DateTime<Utc>) -> Result<()> {
+        let conn = self.db.connection();
+        let conn = conn.lock().unwrap();
+
+        conn.execute(
+            "UPDATE messages SET status = 'read', read_at = ? WHERE id = ?",
+            params![read_at.timestamp(), id],
         )?;
 
         Ok(())
@@ -540,6 +643,105 @@ mod tests {
 
         let results = repo.search(Some("conv1"), "Test", 10);
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_find_by_send_timestamp() {
+        let (db, _dir) = create_test_db();
+        create_test_conversation(&db, "conv1");
+        let repo = MessageRepository::new(&db);
+
+        // Messages sent moments ago are still awaiting confirmation by the server.
+        let mut msg = Message::new_text("conv1", "sender1", "Hello World");
+        msg.status = MessageStatus::Sending;
+        msg.sent_at = Utc::now();
+        repo.save(&msg).unwrap();
+
+        // Older messages are not candidates for a receipt at this time.
+        let mut old_msg = Message::new_text("conv1", "sender1", "Old World");
+        old_msg.status = MessageStatus::Sending;
+        old_msg.sent_at = Utc::now() - chrono::Duration::days(2);
+        repo.save(&old_msg).unwrap();
+
+        let now = Utc::now().timestamp();
+        assert_eq!(repo.find_by_send_timestamp(now - 60, now + 60).len(), 1);
+        assert_eq!(repo.find_by_send_timestamp(now - 3600 * 48, now - 3600 * 47).len(), 1);
+    }
+
+    #[test]
+    fn test_find_pending_across_all_conversations() {
+        let (db, _dir) = create_test_db();
+        create_test_conversation(&db, "conv1");
+        create_test_conversation(&db, "conv2");
+        let repo = MessageRepository::new(&db);
+
+        // Two pending messages in different conversations at nearly the same time.
+        let mut msg1 = Message::new_text("conv1", "sender1", "First");
+        msg1.status = MessageStatus::Sending;
+        msg1.sent_at = Utc::now() - chrono::Duration::seconds(5);
+        repo.save(&msg1).unwrap();
+
+        let mut msg2 = Message::new_text("conv2", "sender1", "Second");
+        msg2.status = MessageStatus::Sending;
+        msg2.sent_at = Utc::now();
+        repo.save(&msg2).unwrap();
+
+        // The row closest to the echo timestamp is chosen, regardless of conversation.
+        let now = Utc::now().timestamp();
+        assert_eq!(repo.find_pending_across_all_conversations(now - 60, now + 60, now).unwrap(), msg2.id);
+        assert_eq!(
+            repo.find_pending_across_all_conversations(now - 60, now + 60, now - 10).unwrap(),
+            msg1.id
+        );
+
+        // Older pending messages are not found.
+        let mut old_msg = Message::new_text("conv1", "sender1", "Old");
+        old_msg.status = MessageStatus::Sending;
+        old_msg.sent_at = Utc::now() - chrono::Duration::hours(2);
+        repo.save(&old_msg).unwrap();
+        assert_eq!(repo.find_pending_across_all_conversations(now - 60, now + 60, now).unwrap(), msg2.id);
+
+        // Only rows that are still awaiting confirmation are found.
+        let mut sent_msg = Message::new_text("conv1", "sender1", "Sent already");
+        sent_msg.status = MessageStatus::Sent;
+        sent_msg.sent_at = Utc::now() - chrono::Duration::seconds(30);
+        repo.save(&sent_msg).unwrap();
+        assert_eq!(repo.find_pending_across_all_conversations(now - 60, now + 60, now).unwrap(), msg2.id);
+
+        // A pending message that is older than the window is not found.
+        let mut other = Message::new_text("conv1", "sender1", "Older pending");
+        other.status = MessageStatus::Sending;
+        other.sent_at = Utc::now() - chrono::Duration::minutes(3);
+        repo.save(&other).unwrap();
+        assert_eq!(repo.find_pending_across_all_conversations(now - 60, now + 60, now).unwrap(), msg2.id);
+    }
+
+    #[test]
+    fn test_mark_delivered_skips_read_messages() {
+        let (db, _dir) = create_test_db();
+        create_test_conversation(&db, "conv1");
+        let repo = MessageRepository::new(&db);
+
+        let mut msg = Message::new_text("conv1", "sender1", "Hello World");
+        msg.status = MessageStatus::Sending;
+        msg.sent_at = Utc::now();
+        repo.save(&msg).unwrap();
+
+        // A read receipt marks the message as read...
+        repo.mark_read_single(&msg.id, Utc::now()).unwrap();
+        assert_eq!(repo.get(&msg.id).unwrap().status, MessageStatus::Read);
+
+        // ... and a delivery receipt must not downgrade it.
+        repo.mark_delivered(&[msg.id.clone()], Utc::now()).unwrap();
+        assert_eq!(repo.get(&msg.id).unwrap().status, MessageStatus::Read);
+
+        // Unread messages still get marked as delivered.
+        let mut other = Message::new_text("conv1", "sender1", "Another World");
+        other.status = MessageStatus::Sending;
+        other.sent_at = Utc::now();
+        repo.save(&other).unwrap();
+        repo.mark_delivered(&[other.id.clone()], Utc::now()).unwrap();
+        assert_eq!(repo.get(&other.id).unwrap().status, MessageStatus::Delivered);
     }
 
     #[test]

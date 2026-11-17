@@ -28,8 +28,8 @@ egui-twemoji = "0.5"
 # - Critical deadlock fix in backpressure handling
 # - HTTP 422 message reception fix
 # - CDSI integration for improved contact sync
-presage = { git = "https://github.com/whisperfish/presage", rev = "20d39de1" }
-presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "20d39de1" }
+presage = { git = "https://github.com/whisperfish/presage", rev = "743ed833f38d98209e0fa126df1806d820638cf4" }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "743ed833f38d98209e0fa126df1806d820638cf4" }
 
 # Async Runtime
 tokio = { version = "1", features = ["full"] }
@@ -101,10 +101,6 @@ hex = "0.4"
 # Clipboard
 arboard = "3"
 
-# macOS dock icon support - fruitbasket provides runtime app bundle trampoline
-[target.'cfg(target_os = "macos")'.dependencies]
-fruitbasket = "0.10"
-
 # Random number generation
 rand = "0.9"
 
@@ -114,15 +110,25 @@ semver = "1"
 mime_guess = "2"
 getrandom = "0.3"
 
+# Color emoji rasterization (system font support)
+unicode-segmentation = "1.12.0"
+
+# Twemoji SVG assets
+twemoji-assets = "1.5.1"
+
+# Emojis crate
+emojis = "0.6"
+
 # SQLite database for app data (messages, conversations, settings)
 # Using SQLCipher for at-rest encryption
 # Using whisperfish fork to match presage-store-sqlite requirements (patched below)
 rusqlite = { git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc", features = ["bundled-sqlcipher"] }
 keyring = "3"
 argon2 = "0.5"
-unicode-segmentation = "1.12.0"
-twemoji-assets = "1.5.1"
-emojis = "0.6"
+
+# macOS dock icon support - fruitbasket provides runtime app bundle trampoline
+[target.'cfg(target_os = "macos")'.dependencies]
+fruitbasket = "0.10"
 
 [profile.release]
 lto = true

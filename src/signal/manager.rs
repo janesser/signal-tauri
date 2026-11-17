@@ -7,21 +7,27 @@ macro_rules! send_event {
     }};
 }
 
+use crate::signal::messages::MessageStatus;
 use crate::signal::provisioning;
-use crate::signal::registration;
 use crate::signal::SignalError;
 use crate::storage::contacts::{ContactRepository, StoredContact};
+use crate::storage::messages::MessageRepository;
 use crate::storage::Storage;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::channel::oneshot;
 use futures::StreamExt;
 use parking_lot::Mutex;
 use presage::libsignal_service::configuration::SignalServers;
+use presage::libsignal_service::content::ContentBody;
 use presage::libsignal_service::prelude::Content;
-use presage::libsignal_service::protocol::ServiceId;
 use presage::libsignal_service::proto::DataMessage;
+use presage::libsignal_service::proto::ReceiptMessage;
+use presage::libsignal_service::proto::SyncMessage;
+use presage::libsignal_service::proto::receipt_message;
+use presage::libsignal_service::proto::sync_message::{self, Content as SyncContent};
+use presage::libsignal_service::protocol::ServiceId;
 use presage::model::messages::Received;
-use presage::manager::Registered;
+use presage::manager::{Registered, RegistrationData};
 use presage::store::ContentsStore;
 use presage::Manager;
 use presage_store_sqlite::{OnNewIdentity, SqliteStore};
@@ -73,6 +79,8 @@ pub enum SignalEvent {
     DeliveryReceipt { message_id: String, recipient: String },
     /// Message read receipt
     ReadReceipt { message_id: String, recipient: String },
+    /// The status of a message we sent changed
+    MessageStatusChanged { message_id: String, status: crate::signal::messages::MessageStatus },
     /// Typing indicator
     TypingStarted { conversation_id: String },
     /// Typing stopped
@@ -189,16 +197,19 @@ impl SignalManager {
         });
     }
 
-    /// Perform the actual linking process using custom provisioning
-    /// 
-    /// This custom flow captures the ephemeral_backup_key from the provision message,
-    /// which enables message history sync from the primary device.
+    /// Perform the actual linking process using presage's built-in secondary
+    /// device linking.
+    ///
+    /// Presage handles the WebSocket provisioning, sends the URL through a
+    /// channel (forwarded as `SignalEvent::ProvisioningUrlReady`), performs the
+    /// full link_device handshake and stores registration data in the SQLite
+    /// store — all on behalf of the caller.
     async fn perform_linking(
         storage: &Arc<Storage>,
         device_name: &str,
         event_tx: mpsc::UnboundedSender<SignalEvent>,
     ) -> Result<(), SignalError> {
-        tracing::info!("Starting device linking process with custom provisioning...");
+        tracing::info!("Starting device linking process with presage...");
 
         // Get database path
         let db_path = storage.signal_db_path();
@@ -209,7 +220,7 @@ impl SignalManager {
         // Create the SQLite store with encryption
         let passphrase = storage.get_encryption_key();
 
-        let mut store = SqliteStore::open_with_passphrase(
+        let store = SqliteStore::open_with_passphrase(
             &db_url,
             passphrase.as_deref(),
             OnNewIdentity::Trust,
@@ -219,78 +230,63 @@ impl SignalManager {
 
         tracing::info!("Signal store opened successfully");
 
-        let password: String = Alphanumeric.sample_string(&mut rand::rng(), 24);
-
-        tracing::info!("Starting custom provisioning...");
-        let event_tx_for_url = event_tx.clone();
-        let provision_msg = provisioning::run_provisioning_capture(
-            SignalServers::Production,
-            move |url| {
-                tracing::info!("Provisioning URL ready: {}", url);
-                let _ = event_tx_for_url.send(SignalEvent::ProvisioningUrlReady(url.to_string()));
-            },
-        )
-        .await?;
-
-        tracing::info!("Received provision message for phone: {}", provision_msg.phone_number);
-
-        let has_backup_key = provision_msg.ephemeral_backup_key.is_some();
-        if has_backup_key {
-            tracing::info!("Ephemeral backup key available - message history sync possible!");
-            send_event!(event_tx, SignalEvent::MessageHistoryAvailable);
-        } else {
-            tracing::info!("No ephemeral backup key - message history sync not available");
-        }
-
-        tracing::info!("Completing device registration...");
-        let reg_result = registration::complete_registration(
-            &mut store,
-            &provision_msg,
-            device_name,
-            &password,
-            SignalServers::Production,
+        // Use presage's built-in linking. It returns the registration data (phone
+        // number, device id, ephemeral backup key) and a registered manager.
+        let (registration_data, mut manager) = provisioning::link_device(
+            store,
+            device_name.to_string(),
+            event_tx.clone(),
         )
         .await?;
 
         tracing::info!(
-            "Device registered successfully! ACI: {}, Device ID: {}",
-            reg_result.aci,
-            reg_result.device_id
+            "Device linked successfully! ACI: {}, Device ID: {:?}",
+            registration_data.service_ids.aci,
+            registration_data.device_id
         );
 
-        if let Err(e) = storage.save_account(&reg_result.phone_number, reg_result.device_id) {
-            tracing::error!("Failed to save account: {}", e);
-        }
+        storage.save_account(
+            &registration_data.phone_number.to_string(),
+            registration_data.device_id.unwrap_or(0),
+        )
+        .map_err(|e| SignalError::StorageError(e.to_string()))?;
 
-        if has_backup_key {
-            tracing::info!("Initiating message history sync...");
-            if let Some(backup_key) = provisioning::get_ephemeral_backup_key() {
-                match Self::sync_message_history(
-                    &backup_key,
-                    &reg_result.aci,
-                    reg_result.device_id,
-                    &reg_result.password,
-                    storage,
-                    event_tx.clone(),
-                ).await {
-                    Ok(count) => {
-                        tracing::info!("Message history sync completed: {} messages", count);
-                        let _ = event_tx.send(SignalEvent::MessageHistorySyncCompleted { 
-                            message_count: count 
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!("Message history sync failed: {}", e);
-                        send_event!(event_tx, SignalEvent::MessageHistorySyncFailed(e.to_string()));
-                    }
+        if provisioning::has_backup_key(&registration_data) {
+            tracing::info!(
+                "Ephemeral backup key available - message history sync possible"
+            );
+            send_event!(event_tx, SignalEvent::MessageHistoryAvailable);
+
+            let backup_key = provisioning::get_ephemeral_backup_key(&registration_data)
+                .expect("Backup key exists");
+
+            match Self::sync_message_history_from_server(
+                &backup_key,
+                &registration_data,
+                storage,
+                event_tx.clone(),
+            )
+            .await
+            {
+                Ok(count) => {
+                    tracing::info!("Message history sync completed: {} messages", count);
+                    let _ = event_tx.send(SignalEvent::MessageHistorySyncCompleted { 
+                        message_count: count 
+                    });
+                }
+                Err(e) => {
+                    tracing::error!("Message history sync failed: {}", e);
+                    send_event!(event_tx, SignalEvent::MessageHistorySyncFailed(e.to_string()));
                 }
             }
+        } else {
+            tracing::info!("No ephemeral backup key - message history sync not available");
         }
 
         tracing::info!("Loading registered manager...");
-        let mut manager = Manager::load_registered(store)
+        let _ = Manager::load_registered(manager.store().clone())
             .await
-            .map_err(|e| SignalError::StorageError(format!("Failed to load manager: {:?}", e)))?;
+            .map_err(|e| SignalError::StorageError(format!("Failed to load manager: {:?}", e)));
 
         tracing::info!("Requesting contacts sync from primary device...");
         if let Err(e) = manager.request_contacts().await {
@@ -303,31 +299,49 @@ impl SignalManager {
         Ok(())
     }
 
-    async fn sync_message_history(
+    /// Create a new Signal manager for device linking (legacy interface)
+    /// Sync message history from the primary device via Signal's storage service.
+    ///
+    /// This requests a transfer archive (an encrypted, gzipped protobuf backup of
+    /// the primary device's message history) from Signal's servers and imports it
+    /// into local storage. The ephemeral backup key that the primary exchanged while
+    /// linking is required to decrypt the archive; it is single use only, so this
+    /// sync can only happen while the link is fresh. On later connects the server
+    /// only delivers new messages through the receive loop — older history is not
+    /// available again (see also the comment on `SignalEvent::MessageHistoryAvailable`).
+    pub async fn sync_message_history_from_server(
         backup_key: &[u8],
-        aci: &uuid::Uuid,
-        device_id: u32,
-        password: &str,
+        registration_data: &RegistrationData,
         storage: &Arc<Storage>,
         event_tx: mpsc::UnboundedSender<SignalEvent>,
     ) -> Result<u32, SignalError> {
-        tracing::info!("Fetching transfer archive from Signal servers...");
-        
-        let auth_username = format!("{}.{}", aci, device_id);
+        // The account password that presage generated while linking is stored in its
+        // SQLite kv store; it authenticates against the storage service. The ephemeral
+        // backup key that the primary device offered while linking is required to
+        // decrypt the archive and is not persisted after linking, which means this sync
+        // can only happen while the link is fresh (see also the doc comment).
+        let Some(password) = provisioning::read_account_password(storage.signal_db_path().as_path()) else {
+            tracing::warn!("No account password found - message history sync not possible");
+            return Err(SignalError::StorageError("No account password found".to_string()));
+        };
+
+        let auth_username = format!(
+            "{}.{}",
+            registration_data.service_ids.aci,
+            registration_data.device_id.unwrap_or(0)
+        );
         tracing::debug!("Using auth username: {}", auth_username);
-        
-        let _ = event_tx.send(SignalEvent::MessageHistorySyncProgress { 
-            current: 0, 
-            total: 0 
-        });
-        
+
+        event_tx.send(SignalEvent::MessageHistorySyncProgress { current: 0, total: 0 }).ok();
+
         let backup_data = crate::signal::backup::sync_message_history(
-            backup_key,
-            aci,
+            &backup_key,
+            &registration_data.service_ids.aci,
             &auth_username,
-            password,
-        ).await?;
-        
+            &password,
+        )
+        .await?;
+
         let message_count = backup_data.messages.len() as u32;
         let conversation_count = backup_data.conversations.len();
         tracing::info!(
@@ -335,32 +349,31 @@ impl SignalManager {
             message_count,
             conversation_count
         );
-        
-        let _ = event_tx.send(SignalEvent::MessageHistorySyncProgress { 
+
+        event_tx.send(SignalEvent::MessageHistorySyncProgress { 
             current: message_count / 2, 
             total: message_count 
-        });
+        }).ok();
 
         let (convs_imported, msgs_imported) = crate::signal::backup::import_backup_data(
             &backup_data,
             storage,
         )?;
-        
+
         tracing::info!(
             "Imported to storage: {} conversations, {} messages",
             convs_imported,
             msgs_imported
         );
-        
-        let _ = event_tx.send(SignalEvent::MessageHistorySyncProgress { 
+
+        event_tx.send(SignalEvent::MessageHistorySyncProgress { 
             current: message_count, 
             total: message_count 
-        });
+        }).ok();
 
         Ok(msgs_imported as u32)
     }
 
-    /// Create a new Signal manager for device linking (legacy interface)
     pub async fn link_device(
         storage: &Arc<Storage>,
         device_name: &str,
@@ -518,6 +531,11 @@ impl SignalManager {
             .await
             .map_err(|_| SignalError::NotRegistered)?;
 
+        // Our own account identity (ACI), used to detect messages that the server
+        // echoes back for messages we sent ourselves.
+        let own_identity = manager.registration_data().service_ids.aci.to_string();
+        tracing::info!("Starting message receive stream as {}", own_identity);
+
         tracing::info!("Starting message receive stream...");
         send_event!(event_tx, SignalEvent::ConnectionStateChanged(ConnectionState::Connected));
 
@@ -532,6 +550,11 @@ impl SignalManager {
             tokio::select! {
                 received = messages.next() => {
                     match received {
+                        Some(Received::DecryptionError(sender)) => {
+                            tracing::warn!("Got a decryption error from {:?}", sender);
+                            send_event!(event_tx, SignalEvent::Error("Decryption failed".to_string()));
+                            continue;
+                        }
                         Some(Received::QueueEmpty) => {
                             tracing::info!("Message queue synchronized");
 
@@ -611,7 +634,12 @@ impl SignalManager {
                         }
                         Some(Received::Content(content)) => {
                             Self::log_content_verbose(&content);
-                            if let Some(incoming) = Self::process_content(&content) {
+                            if let Some(incoming) = Self::handle_incoming_content(
+                                storage,
+                                &own_identity,
+                                event_tx.clone(),
+                                &content,
+                            ).await {
                                 tracing::info!("Received message from {}", incoming.sender);
                                 send_event!(event_tx, SignalEvent::MessageReceived(incoming));
                             }
@@ -760,14 +788,15 @@ impl SignalManager {
         use presage::libsignal_service::content::ContentBody;
 
         let sender = format!("{:?}", content.metadata.sender);
-        let timestamp = content.metadata.timestamp;
+        let client_timestamp = content.metadata.client_timestamp.timestamp();
+        let timestamp = client_timestamp;
 
         match &content.body {
             ContentBody::DataMessage(dm) => {
                 tracing::debug!(
                     "[VERBOSE] DataMessage from={} ts={} body={:?} group={:?} attachments={}",
                     sender,
-                    timestamp,
+                    client_timestamp,
                     dm.body.as_ref().map(|b| if b.len() > 50 { format!("{}...", &b[..50]) } else { b.clone() }),
                     dm.group_v2.is_some(),
                     dm.attachments.len()
@@ -775,24 +804,19 @@ impl SignalManager {
             }
             ContentBody::SynchronizeMessage(sync) => {
                 tracing::info!(
-                    "[VERBOSE] SyncMessage from={} ts={} sent={} contacts={} blocked={} request={} keys={} fetch_latest={} message_request={} configuration={} sticker_pack={} view_once={} verified={} call_event={}",
+                    "[VERBOSE] SyncMessage from={} ts={}",
                     sender,
-                    timestamp,
-                    sync.sent.is_some(),
-                    sync.contacts.is_some(),
-                    sync.blocked.is_some(),
-                    sync.request.is_some(),
-                    sync.keys.is_some(),
-                    sync.fetch_latest.is_some(),
-                    sync.message_request_response.is_some(),
-                    sync.configuration.is_some(),
-                    sync.sticker_pack_operation.len(),
-                    sync.view_once_open.is_some(),
-                    sync.verified.is_some(),
-                    sync.call_event.is_some(),
+                    client_timestamp,
                 );
                 
-                if let Some(sent) = &sync.sent {
+                // The sync message content is now an enum of the individual
+                // sync message variants (Sent, Request, Keys, ...).
+                if let Some(sent) = &sync.content.as_ref()
+                    .and_then(|c| match c {
+                        presage::libsignal_service::proto::sync_message::Content::Sent(s) => Some(s),
+                        _ => None,
+                    })
+                {
                     tracing::info!(
                         "[VERBOSE]   sent: dest={:?} ts={:?} has_message={} has_story={} edit_message={} unidentified_status={}",
                         sent.destination_service_id,
@@ -812,11 +836,21 @@ impl SignalManager {
                     }
                 }
                 
-                if let Some(request) = &sync.request {
+                if let Some(request) = &sync.content.as_ref()
+                    .and_then(|c| match c {
+                        presage::libsignal_service::proto::sync_message::Content::Request(r) => Some(r),
+                        _ => None,
+                    })
+                {
                     tracing::info!("[VERBOSE]   request: type={:?}", request.r#type);
                 }
                 
-                if let Some(fetch) = &sync.fetch_latest {
+                if let Some(fetch) = &sync.content.as_ref()
+                    .and_then(|c| match c {
+                        presage::libsignal_service::proto::sync_message::Content::FetchLatest(f) => Some(f),
+                        _ => None,
+                    })
+                {
                     tracing::info!("[VERBOSE]   fetch_latest: type={:?}", fetch.r#type);
                 }
             }
@@ -835,20 +869,285 @@ impl SignalManager {
             ContentBody::StoryMessage(_) => {
                 tracing::debug!("[VERBOSE] StoryMessage from={}", sender);
             }
-            ContentBody::PniSignatureMessage(_) => {
-                tracing::debug!("[VERBOSE] PniSignatureMessage from={}", sender);
-            }
             ContentBody::EditMessage(_) => {
                 tracing::debug!("[VERBOSE] EditMessage from={}", sender);
+            }
+            ContentBody::DecryptionErrorMessage(e) => {
+                tracing::warn!(
+                    "[VERBOSE] DecryptionErrorMessage from={} error={:?}",
+                    sender,
+                    e
+                );
             }
         }
     }
 
-    fn process_content(content: &Content) -> Option<IncomingMessage> {
-        use presage::libsignal_service::content::ContentBody;
+    /// Handle an incoming content envelope.
+    ///
+    /// This is the single point where a decrypted message from Signal gets turned
+    /// into something the app can work with: delivery and read receipts update the
+    /// local message status instead of creating a new message row, messages that
+    /// the server echoes back for messages we sent ourselves are confirmed in the
+    /// local store (so they don't show up as another, incoming, message), and only
+    /// genuine incoming messages are turned into an `IncomingMessage`.
+    async fn handle_incoming_content(
+        storage: &Arc<Storage>,
+        own_identity: &str,
+        event_tx: mpsc::UnboundedSender<SignalEvent>,
+        content: &Content,
+    ) -> Option<IncomingMessage> {
+        // Delivery and read receipts update the status of messages we sent instead
+        // of adding a new message to the conversation.
+        if let ContentBody::ReceiptMessage(receipt) = &content.body {
+            Self::handle_delivery_receipt(storage, receipt, content, event_tx.clone()).await;
+            return None;
+        }
 
+        // Read receipts that arrive via the sync channel — these are sent by the
+        // recipient's other devices.
+        if let ContentBody::SynchronizeMessage(sync_message) = &content.body {
+            if !sync_message.read.is_empty() {
+                Self::handle_sync_read_receipts(storage, sync_message, event_tx.clone()).await;
+            }
+        }
+
+        // The server echoes back the messages we sent ourselves so that all linked
+        // devices see them. Those are handled as send confirmations and aren't
+        // created as a new message row here.
+        if Self::handle_our_own_message_echo(storage, own_identity, content, event_tx.clone()).await.is_some() {
+            return None;
+        }
+
+        Self::process_content(content)
+    }
+
+    /// Mark the messages that a delivery/read receipt refers to in local storage.
+    async fn handle_delivery_receipt(
+        storage: &Arc<Storage>,
+        receipt: &ReceiptMessage,
+        content: &Content,
+        event_tx: mpsc::UnboundedSender<SignalEvent>,
+    ) {
+        let Some(db) = storage.database() else {
+            tracing::warn!("No database available, cannot mark messages delivered");
+            return;
+        };
+        let repo = MessageRepository::new(&db);
+
+        // The server identifies the receipt only by the send timestamp of the message it
+        // refers to and doesn't tell us which conversation it was in (not for groups), so we
+        // match all messages we sent at that time.
+        let now = Utc::now();
+        let is_read = matches!(receipt.r#type(), receipt_message::Type::Read | receipt_message::Type::Viewed);
+
+        for timestamp in &receipt.timestamp {
+            let message_ids = repo.find_by_send_timestamp(
+                (*timestamp as i64) / 1000 - 60,
+                (*timestamp as i64) / 1000 + 60,
+            );
+
+            if message_ids.is_empty() {
+                tracing::debug!("No sent messages found for receipt at {}", timestamp);
+                continue;
+            }
+
+            tracing::debug!(
+                "Marking {} messages as {:?}",
+                message_ids.len(),
+                if is_read { MessageStatus::Read } else { MessageStatus::Delivered }
+            );
+
+            // Emit an event so the app invalidates its caches and refreshes the display.
+            if is_read {
+                for message_id in &message_ids {
+                    if let Err(e) = repo.mark_read_single(message_id, now) {
+                        tracing::warn!("Failed to mark message {} as read: {}", message_id, e);
+                    } else {
+                        let _ = event_tx.send(SignalEvent::ReadReceipt {
+                            message_id: message_id.clone(),
+                            recipient: Self::normalize_service_id(&content.metadata.sender.service_id_string()),
+                        });
+                    }
+                }
+            } else if let Err(e) = repo.mark_delivered(&message_ids, now) {
+                tracing::warn!("Failed to mark messages as delivered: {}", e);
+            } else {
+                for message_id in &message_ids {
+                    let _ = event_tx.send(SignalEvent::DeliveryReceipt {
+                        message_id: message_id.clone(),
+                        recipient: Self::normalize_service_id(&content.metadata.sender.service_id_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Mark the messages that a read receipt over the sync channel refers to.
+    ///
+    /// The read receipts of the other person's devices arrive via the sync channel and are
+    /// identified by the timestamp of the message they were sent at, just like delivery
+    /// receipts: we match them against our own sent messages instead of relying on a
+    /// conversation ID that the server doesn't provide.
+    async fn handle_sync_read_receipts(
+        storage: &Arc<Storage>,
+        sync_message: &SyncMessage,
+        event_tx: mpsc::UnboundedSender<SignalEvent>,
+    ) {
+        let Some(db) = storage.database() else { return };
+        let repo = MessageRepository::new(&db);
+
+        let now = Utc::now();
+
+        for read in &sync_message.read {
+            let Some(timestamp) = read.timestamp else { continue };
+
+            let message_ids = repo.find_by_send_timestamp(
+                (timestamp as i64) / 1000 - 60,
+                (timestamp as i64) / 1000 + 60,
+            );
+
+            if message_ids.is_empty() {
+                tracing::debug!("No sent messages found for read receipt at {}", timestamp);
+                continue;
+            }
+
+            tracing::debug!(
+                "Marking {} messages as read",
+                message_ids.len()
+            );
+
+            for message_id in &message_ids {
+                if let Err(e) = repo.mark_read_single(message_id, now) {
+                    tracing::warn!("Failed to mark message {} as read: {}", message_id, e);
+                } else {
+                    let _ = event_tx.send(SignalEvent::ReadReceipt {
+                        message_id: message_id.clone(),
+                        recipient: read.sender_aci.clone().unwrap_or_default(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Confirm a message that the server echoed back for one we sent ourselves.
+    ///
+    /// When we send a message, the Signal server echoes it back to us as a
+    /// `SyncMessage::Sent` (or, in some configurations, as a direct content
+    /// message from our own identity) so that all linked devices see it. If this
+    /// echo was also saved as an *incoming* message, every sent message would
+    /// appear twice in the conversation — the "echo/feedback loop".
+    ///
+    /// This looks for a locally-sent message that is still awaiting confirmation
+    /// (status `sending`) in the same conversation and at roughly the same
+    /// timestamp, and confirms it instead of creating a duplicate row.
+    async fn handle_our_own_message_echo(
+        storage: &Arc<Storage>,
+        own_identity: &str,
+        content: &Content,
+        event_tx: mpsc::UnboundedSender<SignalEvent>,
+    ) -> Option<String> {
+        // Only messages that we sent ourselves are candidates here — everything
+        // else is a genuine incoming message. Sync messages from our other devices
+        // (e.g. the primary) are not echoes of our own sends.
+        let is_echo = match &content.body {
+            ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(SyncContent::Sent(_)),
+                ..
+            }) => content.metadata.sender.raw_uuid().to_string() == own_identity,
+            ContentBody::DataMessage(_) => content.metadata.sender.raw_uuid().to_string() == own_identity,
+            _ => false,
+        };
+
+        if !is_echo {
+            return None;
+        }
+
+        // Determine the conversation this message belongs to. Some echoes don't report one
+        // (self-delivered messages), in which case we search across all conversations below.
+        let (conversation_id, timestamp) = match &content.body {
+            ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(SyncContent::Sent(sent)),
+                ..
+            }) => {
+                // Group messages are identified by the base64 master key of the group - exactly
+                // like `process_sync_message` would - falling back to the destination service ID.
+                let conversation_id = sent.message.as_ref()
+                    .and_then(|msg| msg.group_v2.as_ref())
+                    .and_then(|group| group.master_key.as_ref())
+                    .map(|master_key| {
+                        base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            master_key,
+                        )
+                    })
+                    .or_else(|| sent.destination_service_id.as_deref().map(Self::normalize_service_id));
+
+                match conversation_id {
+                    Some(id) => (Some(id), sent.timestamp.unwrap_or_default()),
+                    None => (None, sent.timestamp.unwrap_or_default()),
+                }
+            }
+            ContentBody::DataMessage(data_msg) => {
+                let conversation_id = if let Some(group) = &data_msg.group_v2 {
+                    match group.master_key.as_ref() {
+                        Some(master_key) => base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            master_key,
+                        ),
+                        None => content.metadata.sender.raw_uuid().to_string(),
+                    }
+                } else {
+                    content.metadata.sender.raw_uuid().to_string()
+                };
+                (Some(conversation_id), data_msg.timestamp.unwrap_or(content.metadata.client_timestamp.timestamp() as u64))
+            }
+            _ => return None,
+        };
+
+        let Some(db) = storage.database() else {
+            tracing::warn!("No database available, cannot confirm message echo");
+            return None;
+        };
+        let repo = MessageRepository::new(&db);
+
+        // Look for a locally-sent message that hasn't been confirmed yet. The server may not
+        // report the conversation reliably (group echoes without group context, or echoes
+        // without a destination), so if nothing matches the reported conversation we also look
+        // across all conversations by timestamp - this is how we know which of our own messages
+        // was echoed back.
+        let timestamp = (timestamp as i64) / 1000;
+        let message_id = match &conversation_id {
+            Some(id) => repo.find_pending(id, timestamp - 60, timestamp + 60).or_else(|| {
+                tracing::debug!("No local message found for echo in conversation {} at {}", id, timestamp);
+                repo.find_pending_across_all_conversations(timestamp - 60, timestamp + 60, timestamp)
+            }),
+            None => repo.find_pending_across_all_conversations(timestamp - 60, timestamp + 60, timestamp),
+        };
+
+        let Some(message_id) = message_id else {
+            return None;
+        };
+
+        // Confirm the message instead of creating a duplicate row.
+        if let Err(e) = repo.update_status(&message_id, MessageStatus::Sent) {
+            tracing::warn!("Failed to confirm message {}: {}", message_id, e);
+            return None;
+        }
+
+        // Notify the app so that it refreshes the message status in the UI.
+        send_event!(event_tx, SignalEvent::MessageStatusChanged { message_id: message_id.clone(), status: MessageStatus::Sent });
+
+        tracing::debug!(
+            "Confirmed message {} echoed back by the server",
+            message_id
+        );
+
+        Some(message_id)
+    }
+
+    fn process_content(content: &Content) -> Option<IncomingMessage> {
         let sender = content.metadata.sender.raw_uuid().to_string();
-        let timestamp = content.metadata.timestamp as i64;
+        let timestamp = content.metadata.client_timestamp.timestamp() as i64;
 
         match &content.body {
             ContentBody::DataMessage(data_msg) => {
@@ -856,10 +1155,6 @@ impl SignalManager {
             }
             ContentBody::SynchronizeMessage(sync_msg) => {
                 Self::process_sync_message(sync_msg, &sender, timestamp)
-            }
-            ContentBody::ReceiptMessage(receipt) => {
-                tracing::debug!("Received receipt: {:?}", receipt);
-                None
             }
             ContentBody::TypingMessage(typing) => {
                 tracing::debug!("Received typing indicator: {:?}", typing);
@@ -920,7 +1215,15 @@ impl SignalManager {
         _sender: &str,
         timestamp: i64,
     ) -> Option<IncomingMessage> {
-        if let Some(sent) = &sync_msg.sent {
+        // In presage 743ed833 the sync message fields are now wrapped in a
+        // `content: Option<SyncContent>` enum, so the sent-message variant is
+        // matched directly from that.
+        // `content` is now an enum of sync message variants; only the sent
+        // variant carries a real data message that we can show to the user.
+        if let Some(
+            presage::libsignal_service::proto::sync_message::Content::Sent(sent),
+        ) = &sync_msg.content
+        {
             if let Some(data_msg) = &sent.message {
                 let text = data_msg.body.clone().unwrap_or_default();
                 if text.is_empty() && data_msg.attachments.is_empty() {
