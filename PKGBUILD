@@ -15,12 +15,16 @@ source=("signal-tauri::git+https://github.com/janesser/signal-tauri.git")
 pkgrel=1
 
 pkgver() {
-  # mirror Cargo.toml's version (TOML: `version = "0.1.0"` — the spaces matter) and
-  # append the git commit so every upstream change yields a new version. makepkg calls
-  # pkgver() before the sources are extracted, so fall back to the repo itself when
-  # the package dir is not available yet.
+  printf 'DBG: called pkgver\n' >> .called.log
   echo "0.1.0"
 }
+
+# check whether makepkg sees pkgver as a function
+if declare -f pkgver >/dev/null 2>&1; then
+  printf 'DBG: declare -f sees function\n' >> .called.log
+else
+  printf 'DBG: declare -f does NOT see function\n' >> .called.log
+fi
 
 package() {
   # the container (archlinux:base-devel, --network host) resolves crates.io and the
