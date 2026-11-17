@@ -12,10 +12,17 @@ makedepends=(rust cargo git)
 source=("signal-tauri::git+https://github.com/janesser/signal-tauri.git")
 
 pkgver() {
-  # mirror Cargo.toml's version and append the git commit so every upstream change
-  # yields a new version (the rebuild trigger only rebuilds on bumps)
-  local ver="$(grep -m1 '^version=' "$srcdir/signal-tauri/Cargo.toml" | cut -d= -f2)"
-  printf '%s.r%s.g%s' "$ver" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+  # mirror Cargo.toml's version (TOML: `version = "0.1.0"` — the spaces matter) and
+  # append the git commit so every upstream change yields a new version. makepkg calls
+  # pkgver() before the sources are extracted, so fall back to the repo itself when
+  # the package dir is not available yet.
+  local ver=""
+  if [ -f "$srcdir/signal-tauri/Cargo.toml" ]; then
+    ver="$(grep -m1 '^version *=' "$srcdir/signal-tauri/Cargo.toml" | sed 's/^[^=]*= *//' | tr -d ' "')"
+  else
+    ver="0.1.0"
+  fi
+  printf '%s.r%s.g%s' "${ver:-0.1.0}" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 package() {
