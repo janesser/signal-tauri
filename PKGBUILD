@@ -19,15 +19,22 @@ pkgver=0.1.0.r0.g
 pkgver() {
   # mirror Cargo.toml's version (TOML: `version = "0.1.0"` -- the spaces matter) and
   # append the git commit so every upstream change yields a new version. makepkg calls
-  # pkgver() before the sources are extracted, so fall back to the repo itself when the
-  # package dir is not available yet.
+  # pkgver() after the sources are extracted, with its cwd set to $srcdir — which does
+  # not carry .git (the repo is at $srcdir/signal-tauri/), so point at it explicitly.
+  # When a build host sources this PKGBUILD directly (from a plain clone), the repo is
+  # right here at the root, and Cargo.toml sits at the root too.
   local ver=""
-  if [ -f "$srcdir/signal-tauri/Cargo.toml" ]; then
+  if [ -f "Cargo.toml" ]; then
+    ver="$(grep -m1 '^version *=' Cargo.toml | sed 's/^[^=]*= *//' | tr -d ' "')"
+  elif [ -f "$srcdir/signal-tauri/Cargo.toml" ]; then
     ver="$(grep -m1 '^version *=' "$srcdir/signal-tauri/Cargo.toml" | sed 's/^[^=]*= *//' | tr -d ' "')"
   else
     ver="0.1.0"
   fi
-  printf '%s.r%s.g%s' "${ver:-0.1.0}" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+  # makepkg runs with cwd=$srcdir (no .git); a build host sources from the clone root (.git).
+  git_dir="$([ -d "$srcdir/signal-tauri/.git" ] && printf '%s' "$srcdir/signal-tauri/.git" || printf '%s' ".git")"
+  printf '%s.r%s.g%s' "${ver:-0.1.0}" "$(git --git-dir "$git_dir" rev-list --count HEAD)" \
+      "$(git --git-dir "$git_dir" rev-parse --short HEAD)"
 }
 
 package() {
