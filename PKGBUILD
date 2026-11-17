@@ -15,7 +15,7 @@ source=("signal-tauri::git+https://github.com/janesser/signal-tauri.git")
 pkgrel=1
 
 pkgver() {
-  printf 'DBG: called pkgver\n' >> .called.log
+  printf 'DBG: called pkgver cwd=[%s] srcdir=[%s]\n' "$(pwd)" "$srcdir" >> /builds/signal-tauri-bin/.called.log
   echo "0.1.0"
 }
 
