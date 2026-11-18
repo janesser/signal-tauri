@@ -21,8 +21,10 @@ use parking_lot::Mutex;
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::ContentBody;
 use presage::libsignal_service::prelude::Content;
+use presage::libsignal_service::proto::attachment_pointer::Flags as AttachmentPointerFlags;
 use presage::libsignal_service::proto::DataMessage;
 use presage::libsignal_service::proto::ReceiptMessage;
+use presage::libsignal_service::sender::AttachmentSpec;
 use presage::libsignal_service::proto::TypingMessage;
 use presage::libsignal_service::proto::typing_message;
 use presage::libsignal_service::proto::SyncMessage;
@@ -35,6 +37,7 @@ use presage::store::ContentsStore;
 use presage::Manager;
 use presage_store_sqlite::{OnNewIdentity, SqliteStore};
 use rand::distr::{Alphanumeric, SampleString};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -77,6 +80,13 @@ pub enum SendCommand {
     /// Notify the server that we have read the given messages
     MarkRead {
         message_ids: Vec<String>,
+        reply: oneshot::Sender<Result<(), SignalError>>,
+    },
+    /// Send a voice message from a recorded audio file
+    VoiceMessage {
+        conversation_id: String,
+        file_path: PathBuf,
+        duration_secs: u32,
         reply: oneshot::Sender<Result<(), SignalError>>,
     },
 }
@@ -733,6 +743,22 @@ impl SignalManager {
                             let result = Self::send_read_receipts(&mut manager, storage, &message_ids).await;
                             let _ = reply.send(result);
                         }
+                        Some(SendCommand::VoiceMessage {
+                            conversation_id,
+                            file_path,
+                            duration_secs,
+                            reply,
+                        }) => {
+                            let result = Self::send_voice_with_manager(
+                                &mut manager,
+                                storage,
+                                &conversation_id,
+                                &file_path,
+                                duration_secs,
+                            )
+                            .await;
+                            let _ = reply.send(result);
+                        }
                         None => {
                             tracing::info!("Send channel closed");
                             break;
@@ -1059,6 +1085,120 @@ impl SignalManager {
         }
 
         Ok(())
+    }
+
+    /// Send a voice message from a recorded audio file through the presage manager.
+    ///
+    /// The recording is read here and uploaded to Signal's CDN through presage's
+    /// `upload_attachment`, which returns an `AttachmentPointer` for it - that pointer is then
+    /// linked in a `DataMessage` with the voice message flag set, so both destination types (the
+    /// contact UUID for private conversations, their group master key for groups) get handled by
+    /// the same code path as the other messages.
+    async fn send_voice_with_manager(
+        manager: &mut Manager<SqliteStore, Registered>,
+        storage: &Arc<Storage>,
+        conversation_id: &str,
+        file_path: &Path,
+        duration_secs: u32,
+    ) -> Result<(), SignalError> {
+        // The recording is read here and uploaded to the CDN before the message itself.
+        let contents = tokio::fs::read(file_path)
+            .await
+            .map_err(|e| {
+                SignalError::AttachmentError(format!("Failed to read recording: {}", e))
+            })?;
+
+        tracing::info!(
+            "Uploading voice note ({} bytes) to the Signal CDN",
+            contents.len()
+        );
+
+        let spec = AttachmentSpec {
+            content_type: "audio/webm".to_string(),
+            length: contents.len(),
+            file_name: Some(
+                file_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            ),
+            preview: None,
+            voice_note: Some(true), // marks the pointer with the VoiceMessage flag on the CDN
+            borderless: None,
+            width: None,
+            height: None,
+            caption: None,
+            blur_hash: None,
+        };
+
+        let pointer = manager
+            .upload_attachment(spec, contents)
+            .await
+            .map_err(|e| {
+                SignalError::AttachmentError(format!("Failed to upload voice note: {:?}", e))
+            })?
+            .map_err(|e| {
+                SignalError::AttachmentError(format!("Voice note upload failed: {:?}", e))
+            })?;
+
+        // Resolve the conversation to the destination used to send to it.
+        let destination = Self::resolve_conversation_destination(conversation_id, storage)
+            .ok_or_else(|| {
+                SignalError::SendFailed(format!("Unknown conversation {}", conversation_id))
+            })?;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| SignalError::SendFailed(e.to_string()))?
+            .as_millis() as u64;
+
+        // A voice note is a regular `DataMessage` carrying the uploaded `AttachmentPointer` with
+        // the VoiceMessage flag set. Signal Desktop sends it without a body - the receiving client
+        // uses the attachment pointer to play the audio, so no text is carried here.
+        let data_message = DataMessage {
+            body: None,
+            timestamp: Some(timestamp),
+            attachments: vec![pointer],
+            flags: Some(AttachmentPointerFlags::VoiceMessage as u32),
+            ..Default::default()
+        };
+
+        match destination {
+            ConversationDestination::Private(recipient) => manager
+                .send_message(ServiceId::Aci(recipient.into()), data_message, timestamp)
+                .await
+                .map_err(|e| SignalError::SendFailed(format!("{:?}", e)))?,
+            ConversationDestination::Group(master_key) => manager
+                .send_message_to_group(&master_key, data_message, timestamp)
+                .await
+                .map_err(|e| SignalError::SendFailed(format!("{:?}", e)))?,
+        }
+
+        Ok(())
+    }
+
+    /// Send a voice message from a recorded audio file through the receive loop's presage manager.
+    ///
+    /// The file is uploaded to Signal's CDN and the message, carrying the resulting `AttachmentPointer`
+    /// with the voice note flag set, is sent over a live connection.
+    pub async fn send_voice_message_static(
+        storage: &Arc<Storage>,
+        conversation_id: &str,
+        file_path: &Path,
+        duration_secs: u32,
+    ) -> Result<(), SignalError> {
+        tracing::info!(
+            "Queueing voice message for sending to {}",
+            conversation_id
+        );
+
+        Self::send_via_channel(SendCommand::VoiceMessage {
+            conversation_id: conversation_id.to_string(),
+            file_path: file_path.to_path_buf(),
+            duration_secs,
+            reply: oneshot::channel().0,
+        })
+        .await
     }
 
     fn log_content_verbose(content: &Content) {

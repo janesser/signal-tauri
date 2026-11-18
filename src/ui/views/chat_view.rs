@@ -890,7 +890,7 @@ fn show_message_input(app: &SignalApp, ui: &mut egui::Ui, conversation_id: &str)
 
                 // Send
                 if ui.button("➤").on_hover_text("Send voice message").clicked() {
-                    send_attachment_message(app, conversation_id, &path);
+                    send_attachment_message(app, conversation_id, &path, duration);
                     *voice_state = Some(VoiceState::Idle);
                 }
             });
@@ -937,7 +937,7 @@ fn show_message_input(app: &SignalApp, ui: &mut egui::Ui, conversation_id: &str)
             overlay_emoji_on_textedit(ui, &output, input);
             let _response = output.response;
             if ui.button("➤").on_hover_text("Send").clicked() {
-                send_attachment_message(app, conversation_id, &path_clone);
+                send_attachment_message(app, conversation_id, &path_clone, 0);
                 *pending = None;
                 input.clear();
             }
@@ -1230,7 +1230,12 @@ fn send_message(app: &SignalApp, conversation_id: &str, text: &str) {
 }
 
 /// Send an attachment message (file, image, audio, video) by copying to attachments dir
-fn send_attachment_message(app: &SignalApp, conversation_id: &str, file_path: &std::path::Path) {
+fn send_attachment_message(
+    app: &SignalApp,
+    conversation_id: &str,
+    file_path: &std::path::Path,
+    duration_secs: u32,
+) {
     use crate::signal::messages::{Content, Message, MessageDirection, MessageStatus};
     use crate::storage::conversations::ConversationRepository;
     use crate::storage::messages::MessageRepository;
@@ -1356,10 +1361,40 @@ fn send_attachment_message(app: &SignalApp, conversation_id: &str, file_path: &s
     super::chat_list::invalidate_conversations_cache();
 
     tracing::info!(
-        "Attachment message saved: {} ({}). Signal CDN upload is future work.",
+        "Attachment message saved locally: {} ({}). Queueing send through the manager",
         dest_filename,
         preview_text
     );
+
+    // Voice notes are uploaded to Signal's CDN and linked in a `DataMessage` with the voice
+    // note flag set. Everything else is still just stored locally for now.
+    if content_type_is_audio(&content) {
+        use crate::signal::manager::SignalManager;
+
+        let storage = app.storage().clone();
+        let conversation_id = conversation_id.to_string();
+        let dest_path = dest_path.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create runtime for sending voice note");
+
+            rt.block_on(async move {
+                match SignalManager::send_voice_message_static(
+                    &storage,
+                    &conversation_id,
+                    &dest_path,
+                    duration_secs,
+                )
+                .await
+                {
+                    Ok(()) => tracing::info!("Voice message sent to {}", conversation_id),
+                    Err(e) => tracing::error!("Failed to send voice message: {}", e),
+                }
+            });
+        });
+    }
 }
 
 fn content_type_is_image(content: &crate::signal::messages::Content) -> bool {

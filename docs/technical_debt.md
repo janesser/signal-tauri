@@ -53,10 +53,12 @@ Things that exist in the app as placeholders and still need real implementations
 | Marking messages read on our side (`mark_read`) | Implemented — sends a `ReceiptMessage` with type `VIEWED` back to the sender of each incoming message that was just marked as read; wired from `app.mark_conversation_read()` (conversation list + chat view) |
 | `MarkRead` over the sync channel (our devices) | Handled in `handle_incoming_content()` — `SyncMessage::Read` receipts are matched against our own sent messages and mark them read locally (see "Delivery and read receipts") |
 | UI read-status display | Status icons already render (`chat_view.rs`); they only update once the manager emits receipt events (see "Delivery and read receipts") |
-| Voice messages | Only locally recorded; no send/receive path to Signal yet |
+| Voice messages | Send implemented — the recorded recording is uploaded to Signal's CDN through presage's `upload_attachment` (the spec carries `voice_note = true`, so the returned pointer gets the `VoiceMessage` flag) and a `DataMessage` carrying that pointer is queued for sending; receive side still unhandled - incoming voice notes are lost |
 | Story, call, and payment messages | Shown as "[Unsupported content]" with a log line |
 
-**Note on the send channel.** All outgoing protocol operations (`DirectMessage`, `GroupMessage`, `Reaction`, `Typing`, `MarkRead`) are queued into the receive loop's single `SendCommand` channel and executed by its presage `Manager`, so every command is sent over a live connection. Commands that need no reply (reactions, typing, read receipts) still get one through the same channel for uniformity.
+**Note on the send channel.** All outgoing protocol operations (`DirectMessage`, `GroupMessage`, `Reaction`, `Typing`, `MarkRead`, `VoiceMessage`) are queued into the receive loop's single `SendCommand` channel and executed by its presage `Manager`, so every command is sent over a live connection. Commands that need no reply (reactions, typing, read receipts) still get one through the same channel for uniformity.
+
+**Note on voice notes.** The recorder captures PCM samples and writes them as a WAV file (`cpal` + `hound`). Voice messages are uploaded with `content_type = "audio/webm"` while the file itself is still raw 16-bit PCM - Signal requires Opus-encoded audio in a WebM container (as Signal Desktop does), so playing back remote voice notes will fail until an encoder is added. The receive side also needs work: `process_data_message` ignores attachments without a text body, so incoming voice notes are dropped rather than shown as a voice message row.
 
 ## Notes on the underlying stack
 
