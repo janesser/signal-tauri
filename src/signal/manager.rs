@@ -7,9 +7,10 @@ macro_rules! send_event {
     }};
 }
 
-use crate::signal::messages::MessageStatus;
+use crate::signal::messages::{MessageDirection, MessageStatus};
 use crate::signal::provisioning;
 use crate::signal::SignalError;
+use crate::storage::conversations::{ConversationRepository, ConversationType};
 use crate::storage::contacts::{ContactRepository, StoredContact};
 use crate::storage::messages::MessageRepository;
 use crate::storage::Storage;
@@ -22,6 +23,8 @@ use presage::libsignal_service::content::ContentBody;
 use presage::libsignal_service::prelude::Content;
 use presage::libsignal_service::proto::DataMessage;
 use presage::libsignal_service::proto::ReceiptMessage;
+use presage::libsignal_service::proto::TypingMessage;
+use presage::libsignal_service::proto::typing_message;
 use presage::libsignal_service::proto::SyncMessage;
 use presage::libsignal_service::proto::receipt_message;
 use presage::libsignal_service::proto::sync_message::{self, Content as SyncContent};
@@ -37,6 +40,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// What a message is sent to in a conversation.
+///
+/// Private conversations use the contact's UUID, groups their base64 master key - exactly like
+/// `send_group_with_manager` expects it.
+pub enum ConversationDestination {
+    Private(Uuid),
+    Group(Vec<u8>), // 32-byte base64 group master key
+}
+
 pub enum SendCommand {
     DirectMessage {
         recipient: Uuid,
@@ -46,6 +58,25 @@ pub enum SendCommand {
     GroupMessage {
         group_key: Vec<u8>,
         text: String,
+        reply: oneshot::Sender<Result<(), SignalError>>,
+    },
+    /// React to a message in a conversation (private or group)
+    Reaction {
+        conversation_id: String,
+        message_id: String,
+        emoji: String,
+        remove: bool,
+        reply: oneshot::Sender<Result<(), SignalError>>,
+    },
+    /// Send a typing indicator for a conversation (private or group)
+    Typing {
+        conversation_id: String,
+        is_typing: bool,
+        reply: oneshot::Sender<Result<(), SignalError>>,
+    },
+    /// Notify the server that we have read the given messages
+    MarkRead {
+        message_ids: Vec<String>,
         reply: oneshot::Sender<Result<(), SignalError>>,
     },
 }
@@ -690,6 +721,18 @@ impl SignalManager {
                             let result = Self::send_group_with_manager(&mut manager, &group_key, &text).await;
                             let _ = reply.send(result);
                         }
+                        Some(SendCommand::Reaction { conversation_id, message_id, emoji, remove, reply }) => {
+                            let result = Self::send_reaction_with_manager(&mut manager, storage, &conversation_id, &message_id, &emoji, remove).await;
+                            let _ = reply.send(result);
+                        }
+                        Some(SendCommand::Typing { conversation_id, is_typing, reply }) => {
+                            let result = Self::send_typing_with_manager(&mut manager, storage, &conversation_id, is_typing).await;
+                            let _ = reply.send(result);
+                        }
+                        Some(SendCommand::MarkRead { message_ids, reply }) => {
+                            let result = Self::send_read_receipts(&mut manager, storage, &message_ids).await;
+                            let _ = reply.send(result);
+                        }
                         None => {
                             tracing::info!("Send channel closed");
                             break;
@@ -811,6 +854,210 @@ impl SignalManager {
             .await
             .map_err(|e| SignalError::SendFailed(format!("{:?}", e)))?;
         
+        Ok(())
+    }
+
+    /// Resolve a local conversation ID to the destination used to send to it.
+    fn resolve_conversation_destination(
+        conversation_id: &str,
+        storage: &Arc<Storage>,
+    ) -> Option<ConversationDestination> {
+        let db = storage.database()?;
+        let repo = ConversationRepository::new(&db);
+        let conv = repo.get(conversation_id)?;
+
+        match conv.conversation_type {
+            ConversationType::Private => Uuid::parse_str(&conv.id)
+                .ok()
+                .map(ConversationDestination::Private),
+            ConversationType::Group => base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &conv.id,
+            )
+            .ok()
+            .filter(|k| k.len() == 32)
+            .map(ConversationDestination::Group),
+            // Notes to self are sent to our own identity (presage handles this case)
+            _ => Uuid::parse_str(&conv.id).ok().map(ConversationDestination::Private),
+        }
+    }
+
+    /// Send a reaction through the receive loop's presage manager.
+    ///
+    /// A reaction is a `DataMessage` carrying the `Reaction` payload, just like the primary
+    /// device sends it: emoji + remove flag, plus the author of the message that was reacted to
+    /// so the server can resolve which message in a conversation the reaction belongs to.
+    async fn send_reaction_with_manager(
+        manager: &mut Manager<SqliteStore, Registered>,
+        storage: &Arc<Storage>,
+        conversation_id: &str,
+        message_id: &str,
+        emoji: &str,
+        remove: bool,
+    ) -> Result<(), SignalError> {
+        let Some(destination) = Self::resolve_conversation_destination(conversation_id, storage) else {
+            return Err(SignalError::SendFailed(format!(
+                "Unknown conversation {}",
+                conversation_id
+            )));
+        };
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| SignalError::SendFailed(e.to_string()))?
+            .as_millis() as u64;
+
+        // The message that was reacted to, if the local store knows it. Its author and the time it
+        // was sent at are what the server needs to resolve which message in the conversation this
+        // reaction belongs to.
+        let (target_author_aci, target_sent_timestamp, target_author_aci_binary) = storage.database()
+            .map(|db| {
+                let repo = MessageRepository::new(&db);
+                repo.get(message_id).map(|m| {
+                    let author_uuid = Uuid::parse_str(&m.sender).ok();
+                    (
+                        m.sender.clone(),
+                        m.server_timestamp.unwrap_or(m.sent_at.timestamp()) as u64 * 1000,
+                        author_uuid.map(|u| u.as_bytes().to_vec()),
+                    )
+                })
+            })
+            .flatten()
+            .unwrap_or_else(|| {
+                (message_id.to_string(), timestamp, None)
+            });
+
+        let reaction = presage::libsignal_service::proto::data_message::Reaction {
+            emoji: Some(emoji.to_string()),
+            remove: Some(remove),
+            target_author_aci: Some(target_author_aci),
+            target_sent_timestamp: Some(target_sent_timestamp),
+            target_author_aci_binary,
+        };
+
+        let data_message = DataMessage {
+            reaction: Some(reaction),
+            timestamp: Some(timestamp),
+            ..Default::default()
+        };
+
+        match destination {
+            ConversationDestination::Private(recipient) => manager
+                .send_message(ServiceId::Aci(recipient.into()), data_message, timestamp)
+                .await
+                .map_err(|e| SignalError::SendFailed(format!("{:?}", e)))?,
+            ConversationDestination::Group(master_key) => manager
+                .send_message_to_group(&master_key, data_message, timestamp)
+                .await
+                .map_err(|e| SignalError::SendFailed(format!("{:?}", e)))?,
+        }
+
+        Ok(())
+    }
+
+    /// Send a typing indicator through the receive loop's presage manager.
+    ///
+    /// `is_typing` determines whether the indicator is started (`STARTED`) or stopped (`STOPPED`).
+    /// Group indicators carry the group master key so the server can route them to the members.
+    async fn send_typing_with_manager(
+        manager: &mut Manager<SqliteStore, Registered>,
+        storage: &Arc<Storage>,
+        conversation_id: &str,
+        is_typing: bool,
+    ) -> Result<(), SignalError> {
+        let Some(destination) = Self::resolve_conversation_destination(conversation_id, storage) else {
+            return Err(SignalError::SendFailed(format!(
+                "Unknown conversation {}",
+                conversation_id
+            )));
+        };
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| SignalError::SendFailed(e.to_string()))?
+            .as_millis() as u64;
+
+        let action = if is_typing {
+            typing_message::Action::Started as i32
+        } else {
+            typing_message::Action::Stopped as i32
+        };
+
+        let content = ContentBody::TypingMessage(TypingMessage {
+            timestamp: Some(timestamp),
+            action: Some(action),
+            group_id: match &destination {
+                ConversationDestination::Group(key) => Some(key.clone()),
+                ConversationDestination::Private(_) => None,
+            },
+        });
+
+        match destination {
+            ConversationDestination::Private(recipient) => manager
+                .send_message(ServiceId::Aci(recipient.into()), content, timestamp)
+                .await
+                .map_err(|e| SignalError::SendFailed(format!("{:?}", e)))?,
+            ConversationDestination::Group(master_key) => manager
+                .send_message_to_group(&master_key, content, timestamp)
+                .await
+                .map_err(|e| SignalError::SendFailed(format!("{:?}", e)))?,
+        }
+
+        Ok(())
+    }
+
+    /// Send a `VIEWED` read receipt back to the sender of each given message.
+    ///
+    /// The server identifies messages by the timestamp they were sent at, so this only works for
+    /// messages the local store actually knows: rows that don't exist here (an already-removed
+    /// row) are skipped, and receipts are never sent for our own sends - the sender is us.
+    async fn send_read_receipts(
+        manager: &mut Manager<SqliteStore, Registered>,
+        storage: &Arc<Storage>,
+        message_ids: &[String],
+    ) -> Result<(), SignalError> {
+        let Some(db) = storage.database() else {
+            return Err(SignalError::StorageError("App database not available".to_string()));
+        };
+        let repo = MessageRepository::new(&db);
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| SignalError::SendFailed(e.to_string()))?
+            .as_millis() as u64;
+
+        for message_id in message_ids {
+            let Some(message) = repo.get(message_id) else {
+                tracing::debug!("No local message {} to send a read receipt for", message_id);
+                continue;
+            };
+
+            if matches!(message.direction, MessageDirection::Outgoing) {
+                tracing::debug!("No read receipt for our own message {}", message_id);
+                continue;
+            }
+
+            let Some(sender_uuid) = Uuid::parse_str(&message.sender).ok() else {
+                tracing::warn!("Invalid sender UUID in message {}", message_id);
+                continue;
+            };
+
+            // The server identifies the message by its send timestamp (milliseconds), which is what
+            // the message's local `sent_at` holds - converted here the same way `find_receipt_targets`
+            // expects on the receiving side.
+            let sent_timestamp = message.sent_at.timestamp() as u64 * 1000;
+
+            let content = ContentBody::ReceiptMessage(ReceiptMessage {
+                r#type: Some(receipt_message::Type::Viewed as i32),
+                timestamp: vec![sent_timestamp],
+            });
+
+            manager
+                .send_message(ServiceId::Aci(sender_uuid.into()), content, timestamp)
+                .await
+                .map_err(|e| SignalError::SendFailed(format!("{:?}", e)))?;
+        }
+
         Ok(())
     }
 
@@ -1454,10 +1701,14 @@ impl SignalManager {
         Ok(message_id)
     }
 
-    /// Send a reaction
+    /// Send a reaction to a message in a conversation.
+    ///
+    /// A reaction is a `DataMessage` carrying the `Reaction` payload, sent over the
+    /// receive loop's presage manager (private conversations go to the contact UUID,
+    /// groups to their master key).
     pub async fn send_reaction(
         &self,
-        _conversation_id: &str,
+        conversation_id: &str,
         message_id: &str,
         emoji: &str,
         remove: bool,
@@ -1469,22 +1720,48 @@ impl SignalManager {
             remove
         );
 
-        Ok(())
+        Self::send_via_channel(SendCommand::Reaction {
+            conversation_id: conversation_id.to_string(),
+            message_id: message_id.to_string(),
+            emoji: emoji.to_string(),
+            remove,
+            reply: oneshot::channel().0,
+        }).await
     }
 
-    /// Mark messages as read
+    /// Send read receipts for the given messages to their senders.
+    ///
+    /// The server learns that a message was read only when we tell it: a `ReceiptMessage`
+    /// with type `VIEWED` is sent back to the sender of each incoming message. Messages
+    /// that don't exist here (an already-removed row, for example) are skipped silently.
     pub async fn mark_read(
         &self,
         _conversation_id: &str,
         message_ids: &[String],
     ) -> Result<(), SignalError> {
-        tracing::info!("Marking {} messages as read", message_ids.len());
-        Ok(())
+        tracing::info!("Marking {} messages as read on the server", message_ids.len());
+
+        Self::send_via_channel(SendCommand::MarkRead {
+            message_ids: message_ids.to_vec(),
+        }).await
     }
 
-    /// Send typing indicator
-    pub async fn send_typing(&self, _conversation_id: &str, _is_typing: bool) -> Result<(), SignalError> {
-        Ok(())
+    /// Send a typing indicator for a conversation.
+    ///
+    /// `is_typing` controls whether the indicator is started (`STARTED`) or stopped
+    /// (`STOPPED`); the conversation itself determines whether this goes to the contact
+    /// UUID (private) or the group master key.
+    pub async fn send_typing(
+        &self,
+        conversation_id: &str,
+        is_typing: bool,
+    ) -> Result<(), SignalError> {
+        tracing::info!("Sending typing indicator {} for {}", if is_typing { "started" } else { "stopped" }, conversation_id);
+
+        Self::send_via_channel(SendCommand::Typing {
+            conversation_id: conversation_id.to_string(),
+            is_typing,
+        }).await
     }
 
     pub async fn request_sync(&self) -> Result<(), SignalError> {

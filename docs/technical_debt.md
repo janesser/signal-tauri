@@ -48,13 +48,15 @@ Things that exist in the app as placeholders and still need real implementations
 
 | Area | State |
 | --- | --- |
-| Sending reactions (`send_reaction`) | Stub — never sent to Signal |
-| Sending typing indicators (`send_typing`) | Stub |
-| Marking messages read on our side (`mark_read`) | Stub — only logs |
-| `MarkRead` over the sync channel (our devices) | Not handled in `handle_incoming_content()` — an incoming `SyncMessage::Read` from *ourselves* would still be treated as a genuine incoming message and could duplicate content |
+| Sending reactions (`send_reaction`) | Implemented — queues a `DataMessage` with a `Reaction` payload through the receive loop's presage manager (private conversations to the contact UUID, groups to their master key); wired to a react button on each message bubble |
+| Sending typing indicators (`send_typing`) | Implemented — `TypingMessage::STARTED/STOPPED` through the send channel; wired to the message input's focus state in `chat_view.rs` |
+| Marking messages read on our side (`mark_read`) | Implemented — sends a `ReceiptMessage` with type `VIEWED` back to the sender of each incoming message that was just marked as read; wired from `app.mark_conversation_read()` (conversation list + chat view) |
+| `MarkRead` over the sync channel (our devices) | Handled in `handle_incoming_content()` — `SyncMessage::Read` receipts are matched against our own sent messages and mark them read locally (see "Delivery and read receipts") |
 | UI read-status display | Status icons already render (`chat_view.rs`); they only update once the manager emits receipt events (see "Delivery and read receipts") |
 | Voice messages | Only locally recorded; no send/receive path to Signal yet |
 | Story, call, and payment messages | Shown as "[Unsupported content]" with a log line |
+
+**Note on the send channel.** All outgoing protocol operations (`DirectMessage`, `GroupMessage`, `Reaction`, `Typing`, `MarkRead`) are queued into the receive loop's single `SendCommand` channel and executed by its presage `Manager`, so every command is sent over a live connection. Commands that need no reply (reactions, typing, read receipts) still get one through the same channel for uniformity.
 
 ## Notes on the underlying stack
 

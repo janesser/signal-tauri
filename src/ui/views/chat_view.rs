@@ -25,6 +25,9 @@ static mut CACHED_CONVERSATION_NAME: String = String::new();
 static mut CACHED_MESSAGES: Vec<MessageItem> = Vec::new();
 static MESSAGES_DIRTY: AtomicBool = AtomicBool::new(true);
 
+/// Whether a typing-started indicator was last sent for the message input.
+static TYPING_STARTED: AtomicBool = AtomicBool::new(false);
+
 pub fn invalidate_messages_cache() {
     MESSAGES_DIRTY.store(true, Ordering::SeqCst);
 }
@@ -222,7 +225,7 @@ pub fn show(app: &mut SignalApp, ui: &mut egui::Ui) {
                 }
                 last_date = Some(msg.timestamp);
 
-                show_message(ui, msg);
+                show_message(ui, msg, app, conversation_id);
                 ui.add_space(4.0);
             }
 
@@ -438,7 +441,7 @@ fn format_date(date: &DateTime<Utc>) -> String {
 }
 
 /// Show a single message
-fn show_message(ui: &mut egui::Ui, msg: &MessageItem) {
+fn show_message(ui: &mut egui::Ui, msg: &MessageItem, app: &SignalApp, conversation_id: &str) {
     let is_sent = msg.direction == MessageDirection::Sent;
 
     // Content-based sizing with max-width (like modern messaging apps)
@@ -653,6 +656,11 @@ fn show_message(ui: &mut egui::Ui, msg: &MessageItem) {
                                 }
                             });
                         }
+
+                        // React to this message
+                        if ui.small_button("☺").on_hover_text("React").clicked() {
+                            send_reaction(app, conversation_id, &msg.id, "👍");
+                        }
                     });
                 });
         });
@@ -748,6 +756,11 @@ fn show_message(ui: &mut egui::Ui, msg: &MessageItem) {
                                     ui.small_button(text);
                                 }
                             });
+                        }
+
+                        // React to this message
+                        if ui.small_button("☺").on_hover_text("React").clicked() {
+                            send_reaction(app, conversation_id, &msg.id, "👍");
                         }
                     });
                 });
@@ -984,6 +997,18 @@ fn show_message_input(app: &SignalApp, ui: &mut egui::Ui, conversation_id: &str)
         overlay_emoji_on_textedit(ui, &output, input);
         let response = output.response;
 
+        // Send a typing indicator while the message is composed: one `started` indicator when
+        // composition begins, one `stopped` one when it ends. The guard keeps us from sending
+        // `started` once for every frame the field stays focused.
+        let composing = !input.is_empty();
+        if response.has_focus() && composing && !TYPING_STARTED.load(Ordering::SeqCst) {
+            TYPING_STARTED.store(true, Ordering::SeqCst);
+            send_typing_indicator(app, conversation_id, true);
+        } else if (response.lost_focus() || input.is_empty()) && TYPING_STARTED.load(Ordering::SeqCst) {
+            TYPING_STARTED.store(false, Ordering::SeqCst);
+            send_typing_indicator(app, conversation_id, false);
+        }
+
         // Emoji button — toggle popup using egui's memory-based popup state.
         // Use a fixed Id so it matches between the inner horizontal ui and the outer ui.
         let emoji_popup_id = egui::Id::new("emoji_picker_popup");
@@ -1062,6 +1087,54 @@ fn show_message_input(app: &SignalApp, ui: &mut egui::Ui, conversation_id: &str)
             ui.memory_mut(|mem| mem.close_popup());
         }
     }
+}
+
+/// Send a reaction to a message through the Signal manager.
+///
+/// This is queued from a background thread because sending needs the receive loop's manager.
+fn send_reaction(app: &SignalApp, conversation_id: &str, message_id: &str, emoji: &str) {
+    let conversation_id = conversation_id.to_string();
+    let message_id = message_id.to_string();
+    let emoji = emoji.to_string();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create runtime for sending reaction");
+
+        rt.block_on(async move {
+            if let Some(manager) = app.signal_manager().read().as_ref() {
+                if let Err(e) = manager.send_reaction(&conversation_id, &message_id, &emoji, false).await {
+                    tracing::error!("Failed to send reaction: {}", e);
+                }
+            } else {
+                tracing::warn!("No Signal manager available - not sending reaction");
+            }
+        });
+    });
+}
+
+/// Send a typing indicator for the selected conversation through the Signal manager.
+///
+/// This is queued from a background thread because sending needs the receive loop's manager.
+fn send_typing_indicator(app: &SignalApp, conversation_id: &str, is_typing: bool) {
+    let conversation_id = conversation_id.to_string();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create runtime for typing indicator");
+
+        rt.block_on(async move {
+            if let Some(manager) = app.signal_manager().read().as_ref() {
+                if let Err(e) = manager.send_typing(&conversation_id, is_typing).await {
+                    tracing::error!("Failed to send typing indicator: {}", e);
+                }
+            } else {
+                tracing::warn!("No Signal manager available - not sending typing indicator");
+            }
+        });
+    });
 }
 
 fn send_message(app: &SignalApp, conversation_id: &str, text: &str) {

@@ -551,6 +551,10 @@ impl SignalApp {
         let conv_repo = ConversationRepository::new(&*db);
         let msg_repo = MessageRepository::new(&*db);
 
+        // The incoming messages that are marked as read now - the server learns of it through
+        // `mark_read`, which sends a read receipt back to each sender.
+        let message_ids: Vec<String> = msg_repo.get_unread(conversation_id).iter().map(|m| m.id.clone()).collect();
+
         if let Err(e) = conv_repo.update_unread(conversation_id, 0) {
             tracing::error!("Failed to reset unread count: {}", e);
         }
@@ -558,6 +562,28 @@ impl SignalApp {
             tracing::error!("Failed to mark messages as read: {}", e);
         }
         crate::ui::views::chat_list::invalidate_conversations_cache();
+
+        // Also tell the server that we have read these messages (read receipts). This needs the
+        // receive loop's manager, so it is queued from a background thread. The conversation ID
+        // is owned here because the closure must be 'static.
+        let signal_manager = self.signal_manager().clone();
+        let conversation_id = conversation_id.to_string();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create runtime for sending read receipts");
+
+            rt.block_on(async move {
+                if let Some(manager) = signal_manager.read().as_ref() {
+                    if let Err(e) = manager.mark_read(conversation_id, &message_ids).await {
+                        tracing::error!("Failed to mark messages as read on the server: {}", e);
+                    }
+                } else {
+                    tracing::warn!("No Signal manager available - not sending read receipts");
+                }
+            });
+        });
     }
 
     pub fn avatar_cache(&self) -> &AvatarCache {
